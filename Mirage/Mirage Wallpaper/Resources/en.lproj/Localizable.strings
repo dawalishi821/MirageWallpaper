@@ -868,3 +868,7 @@
 "收藏失败，请稍后重试" = "Could not add to favorites. Try again later.";
 "取消收藏失败，请稍后重试" = "Could not remove from favorites. Try again later.";
 "无法建立 Steam 收藏会话，请重新登录" = "Could not start a Steam favorites session. Sign in again.";
+"正在将“%@”传输至“%@”" = "Transferring “%@” to “%@”";
+"正在打包壁纸" = "Packaging wallpaper";
+"正在上传至移动设备" = "Uploading to mobile device";
+"传输失败：%@" = "Transfer failed: %@";
