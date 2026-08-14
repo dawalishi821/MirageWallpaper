@@ -121,17 +121,13 @@ struct ContentView: View {
                             }
 
                             if loadedSections.contains(.discover) {
-                                FilterSidebarLayout(isPresented: viewModel.isFilterReveal, sidebar: {
-                                    DiscoverFilterSidebar(workshopViewModel: workshopViewModel)
-                                }, content: {
-                                    DiscoverView(
-                                        workshopViewModel: workshopViewModel,
-                                        viewModel: viewModel,
-                                        wallpaperViewModel: wallpaperViewModel,
-                                        navigationModel: navigationModel,
-                                        isActive: navigationModel.selection == .discover
-                                    )
-                                })
+                                DiscoverView(
+                                    workshopViewModel: workshopViewModel,
+                                    viewModel: viewModel,
+                                    wallpaperViewModel: wallpaperViewModel,
+                                    navigationModel: navigationModel,
+                                    isActive: navigationModel.selection == .discover
+                                )
                                 .sectionVisibility(navigationModel.selection == .discover)
                             }
 
@@ -163,6 +159,7 @@ struct ContentView: View {
                                 .sectionVisibility(navigationModel.selection == .subscriptions)
                             }
                         }
+                        .isolatedFromParentLayout()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                     .padding()
@@ -350,6 +347,12 @@ struct ContentView: View {
 }
 
 private extension View {
+    func isolatedFromParentLayout() -> some View {
+        Color.clear
+            .overlay { self }
+            .clipped()
+    }
+
     func sectionVisibility(_ visible: Bool) -> some View {
         opacity(visible ? 1 : 0)
             .allowsHitTesting(visible)

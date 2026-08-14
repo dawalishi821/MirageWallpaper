@@ -437,18 +437,25 @@ struct DeferredCb {
     bool     dead;
 };
 
+struct AudioBufferSlot {
+    uint32_t resolution;
+    JSValue  object { JS_UNDEFINED };
+    JSValue  left { JS_UNDEFINED };
+    JSValue  right { JS_UNDEFINED };
+    JSValue  average { JS_UNDEFINED };
+    JSValue  buffer { JS_UNDEFINED };
+};
+
 struct EngineHostState {
     FrameInputs inputs;
     MediaStatus media;
     bool        media_initialized { false };
     sr::Scene* scene { nullptr };
-    JSValue     audio_buffer { JS_UNDEFINED };
-    JSValue     audio_left_arr { JS_UNDEFINED };
-    JSValue     audio_right_arr { JS_UNDEFINED };
-    JSValue     audio_avg_arr { JS_UNDEFINED };
-    JSValue     audio_buf_arr { JS_UNDEFINED };
-    uint32_t    audio_buffer_resolution { 64 };
-    bool        audio_buffer_built { false };
+    std::array<AudioBufferSlot, 3> audio_buffers {
+        AudioBufferSlot { .resolution = 16 },
+        AudioBufferSlot { .resolution = 32 },
+        AudioBufferSlot { .resolution = 64 },
+    };
     // Cached `globalThis.Vec3` ctor, populated lazily on first node access.
     // Used by the SceneNode wrapper to hand back Vec3 instances so scripts
     // can call `.add` / `.subtract` on `thisLayer.origin`.
@@ -658,6 +665,12 @@ float AudioBufferValue(std::span<const float, 64> bins, uint32_t resolution, uin
     return sum / static_cast<float>(ratio);
 }
 
+AudioBufferSlot& AudioBufferForResolution(EngineHostState& host, uint32_t resolution) {
+    for (auto& slot : host.audio_buffers)
+        if (slot.resolution == resolution) return slot;
+    rstd::unreachable();
+}
+
 // ---------------------------------------------------------------------------
 // FieldScript impl.
 // ---------------------------------------------------------------------------
@@ -699,6 +712,7 @@ struct FieldScript::Impl {
     std::unordered_map<std::string, std::vector<sr::SceneNode*>> asset_clone_queues;
     std::unordered_map<sr::SceneNode*, std::string>              clone_asset_keys;
     std::vector<std::string>                                     registered_assets;
+    std::string                                                  workshop_id;
 };
 
 FieldScript::FieldScript(): m_impl(std::make_unique<Impl>()) {}
@@ -709,6 +723,10 @@ bool               FieldScript::alive() const noexcept { return m_impl->alive; }
 std::string_view   FieldScript::script_sha() const noexcept { return m_impl->sha; }
 std::span<const std::string> FieldScript::RegisteredAssets() const noexcept {
     return m_impl->registered_assets;
+}
+std::optional<std::string_view> FieldScript::WorkshopId() const noexcept {
+    if (m_impl->workshop_id.empty()) return std::nullopt;
+    return m_impl->workshop_id;
 }
 void FieldScript::AddAssetCloneQueue(std::string asset, std::vector<sr::SceneNode*> nodes) {
     if (asset.empty() || nodes.empty()) return;
@@ -830,23 +848,20 @@ void SetAudioArrayValue(JSContext* ctx, JSValueConst arr, uint32_t index, float 
 JSValue EngineRegisterAudioBuffers(JSContext* ctx, JSValueConst /*this_val*/, int argc,
                                    JSValueConst* argv) {
     auto* host = static_cast<EngineHostState*>(JS_GetContextOpaque(ctx));
-    if (! host->audio_buffer_built) {
-        int32_t requested = 64;
-        if (argc > 0) (void)JS_ToInt32(ctx, &requested, argv[0]);
-        host->audio_buffer_resolution = NormalizeAudioResolution(requested);
+    int32_t requested = 64;
+    if (argc > 0) (void)JS_ToInt32(ctx, &requested, argv[0]);
+    auto& slot = AudioBufferForResolution(*host, NormalizeAudioResolution(requested));
+    if (JS_IsUndefined(slot.object)) {
 
         JSValue obj   = JS_NewObject(ctx);
         JSValue left  = JS_NewArray(ctx);
         JSValue right = JS_NewArray(ctx);
         JSValue avg   = JS_NewArray(ctx);
         JSValue buf   = JS_NewArray(ctx);
-        for (uint32_t i = 0; i < host->audio_buffer_resolution; ++i) {
-            const float l =
-                AudioBufferValue(host->inputs.audio_left, host->audio_buffer_resolution, i);
-            const float r =
-                AudioBufferValue(host->inputs.audio_right, host->audio_buffer_resolution, i);
-            const float a =
-                AudioBufferValue(host->inputs.audio_average, host->audio_buffer_resolution, i);
+        for (uint32_t i = 0; i < slot.resolution; ++i) {
+            const float l = AudioBufferValue(host->inputs.audio_left, slot.resolution, i);
+            const float r = AudioBufferValue(host->inputs.audio_right, slot.resolution, i);
+            const float a = AudioBufferValue(host->inputs.audio_average, slot.resolution, i);
             DefineAudioArrayValue(ctx, left, i, l);
             DefineAudioArrayValue(ctx, right, i, r);
             DefineAudioArrayValue(ctx, avg, i, a);
@@ -856,33 +871,31 @@ JSValue EngineRegisterAudioBuffers(JSContext* ctx, JSValueConst /*this_val*/, in
         JS_DefinePropertyValueStr(ctx, obj, "right", JS_DupValue(ctx, right), JS_PROP_C_W_E);
         JS_DefinePropertyValueStr(ctx, obj, "average", JS_DupValue(ctx, avg), JS_PROP_C_W_E);
         JS_DefinePropertyValueStr(ctx, obj, "buffer", JS_DupValue(ctx, buf), JS_PROP_C_W_E);
-        host->audio_buffer       = obj;
-        host->audio_left_arr     = left;
-        host->audio_right_arr    = right;
-        host->audio_avg_arr      = avg;
-        host->audio_buf_arr      = buf;
-        host->audio_buffer_built = true;
+        slot.object  = obj;
+        slot.left    = left;
+        slot.right   = right;
+        slot.average = avg;
+        slot.buffer  = buf;
     }
-    return JS_DupValue(ctx, host->audio_buffer);
+    return JS_DupValue(ctx, slot.object);
 }
 
 // Refresh audio array elements from the host's current FrameInputs.
 // Called by JsRuntime::SetFrameInputs every frame after host->inputs is
 // updated, so the JS side sees the latest values without needing to call
 // registerAudioBuffers again.
-void RefreshAudioBuffer(JSContext* ctx) {
-    auto* host = static_cast<EngineHostState*>(JS_GetContextOpaque(ctx));
-    if (! host->audio_buffer_built) return;
-    for (uint32_t i = 0; i < host->audio_buffer_resolution; ++i) {
-        const float l = AudioBufferValue(host->inputs.audio_left, host->audio_buffer_resolution, i);
-        const float r =
-            AudioBufferValue(host->inputs.audio_right, host->audio_buffer_resolution, i);
-        const float a =
-            AudioBufferValue(host->inputs.audio_average, host->audio_buffer_resolution, i);
-        SetAudioArrayValue(ctx, host->audio_left_arr, i, l);
-        SetAudioArrayValue(ctx, host->audio_right_arr, i, r);
-        SetAudioArrayValue(ctx, host->audio_avg_arr, i, a);
-        SetAudioArrayValue(ctx, host->audio_buf_arr, i, a);
+void RefreshAudioBuffers(JSContext* ctx, EngineHostState& host) {
+    for (auto& slot : host.audio_buffers) {
+        if (JS_IsUndefined(slot.object)) continue;
+        for (uint32_t i = 0; i < slot.resolution; ++i) {
+            const float l = AudioBufferValue(host.inputs.audio_left, slot.resolution, i);
+            const float r = AudioBufferValue(host.inputs.audio_right, slot.resolution, i);
+            const float a = AudioBufferValue(host.inputs.audio_average, slot.resolution, i);
+            SetAudioArrayValue(ctx, slot.left, i, l);
+            SetAudioArrayValue(ctx, slot.right, i, r);
+            SetAudioArrayValue(ctx, slot.average, i, a);
+            SetAudioArrayValue(ctx, slot.buffer, i, a);
+        }
     }
 }
 
@@ -2867,12 +2880,13 @@ JSValue NodeSceneCreateLayer(JSContext* ctx, JSValueConst /*this_val*/, int argc
                 node = it->second.front();
                 it->second.erase(it->second.begin());
             }
-            const bool registered =
-                std::find(fs->m_impl->registered_assets.begin(),
-                          fs->m_impl->registered_assets.end(),
-                          std::string(asset)) != fs->m_impl->registered_assets.end();
-            if (! node && registered && host->layer_factory) {
-                auto created = host->layer_factory(fs->m_impl->node, asset);
+            if (! node && host->layer_factory) {
+                auto created = host->layer_factory(
+                    fs->m_impl->node,
+                    LayerAssetReference {
+                        .path        = asset,
+                        .workshop_id = fs->WorkshopId(),
+                    });
                 if (created) {
                     node                               = (*created).as_ptr();
                     fs->m_impl->clone_asset_keys[node] = asset;
@@ -2920,7 +2934,12 @@ JSValue NodeSceneCreateLayer(JSContext* ctx, JSValueConst /*this_val*/, int argc
         fs->m_impl->clone_queue.erase(fs->m_impl->clone_queue.begin());
     }
     if (! node) return JS_ThrowReferenceError(ctx, "createLayer asset is unavailable");
-    if (! configuration_request) node->SetVisible(true);
+    if (! configuration_request) {
+        if (host->scene)
+            host->scene->SetNodeVisible(*node, true);
+        else
+            node->SetVisible(true);
+    }
     if (! configuration_request || node->Visible()) node->Play();
     if (configuration_request) {
         JSValue perspective = JS_GetPropertyStr(ctx, argv[0], "perspective");
@@ -2933,9 +2952,12 @@ JSValue NodeSceneCreateLayer(JSContext* ctx, JSValueConst /*this_val*/, int argc
 JSValue NodeSceneDestroyLayer(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
     if (argc < 1) return JS_UNDEFINED;
     if (auto* n = GetLayerNode(argv[0])) {
-        n->SetVisible(false);
-        n->Stop();
         auto* host = static_cast<EngineHostState*>(JS_GetContextOpaque(ctx));
+        if (host && host->scene)
+            host->scene->SetNodeVisible(*n, false);
+        else
+            n->SetVisible(false);
+        n->Stop();
         auto* fs   = host ? host->active_field_script : nullptr;
         if (fs) {
             auto key_it = fs->m_impl->clone_asset_keys.find(n);
@@ -2948,13 +2970,39 @@ JSValue NodeSceneDestroyLayer(JSContext* ctx, JSValueConst, int argc, JSValueCon
     return JS_UNDEFINED;
 }
 
-// thisScene.getLayerIndex(layer) / sortLayer(layer, idx). sr doesn't have
-// a draw-order layer index that scripts can mutate at runtime; return 0
-// and no-op so audio-bar style scripts complete init without error.
-JSValue NodeSceneGetLayerIndex(JSContext* ctx, JSValueConst, int, JSValueConst*) {
-    return JS_NewInt32(ctx, 0);
+sr::SceneNode* ResolveSceneLayerArgument(JSContext* ctx, JSValueConst this_val,
+                                         JSValueConst value) {
+    if (auto* node = GetLayerNode(value)) return node;
+    auto* root = GetLayerNode(this_val);
+    if (root == nullptr) return nullptr;
+    const char* name = JS_ToCString(ctx, value);
+    if (name == nullptr) return nullptr;
+    auto* node = root->FindByName(name);
+    JS_FreeCString(ctx, name);
+    return node;
 }
-JSValue NodeSceneSortLayer(JSContext*, JSValueConst, int, JSValueConst*) { return JS_UNDEFINED; }
+
+JSValue NodeSceneGetLayerIndex(JSContext* ctx, JSValueConst this_val, int argc,
+                               JSValueConst* argv) {
+    auto* host = static_cast<EngineHostState*>(JS_GetContextOpaque(ctx));
+    if (host == nullptr || host->scene == nullptr || argc < 1) return JS_NewInt32(ctx, -1);
+    auto* node = ResolveSceneLayerArgument(ctx, this_val, argv[0]);
+    if (node == nullptr) return JS_NewInt32(ctx, -1);
+    auto index = host->scene->LayerIndex(*node);
+    return index ? JS_NewInt64(ctx, static_cast<int64_t>(*index)) : JS_NewInt32(ctx, -1);
+}
+
+JSValue NodeSceneSortLayer(JSContext* ctx, JSValueConst this_val, int argc,
+                           JSValueConst* argv) {
+    auto* host = static_cast<EngineHostState*>(JS_GetContextOpaque(ctx));
+    if (host == nullptr || host->scene == nullptr || argc < 2) return JS_UNDEFINED;
+    auto*   node = ResolveSceneLayerArgument(ctx, this_val, argv[0]);
+    int64_t index {};
+    if (node == nullptr || JS_ToInt64(ctx, &index, argv[1]) != 0 || index < 0)
+        return JS_UNDEFINED;
+    host->scene->SortLayer(*node, static_cast<std::size_t>(index));
+    return JS_UNDEFINED;
+}
 
 JSValue NodePlay(JSContext*, JSValueConst this_val, int, JSValueConst*) {
     if (auto* n = GetLayerNode(this_val)) n->Play();
@@ -3595,13 +3643,14 @@ JsRuntime::~JsRuntime() {
         JS_FreeAtom(m_impl->ctx, m_impl->host.atom_this_scene);
     if (! JS_IsUndefined(m_impl->host.global_obj))
         JS_FreeValue(m_impl->ctx, m_impl->host.global_obj);
-    if (m_impl->host.audio_buffer_built) {
-        JS_FreeValue(m_impl->ctx, m_impl->host.audio_buffer);
-        JS_FreeValue(m_impl->ctx, m_impl->host.audio_left_arr);
-        JS_FreeValue(m_impl->ctx, m_impl->host.audio_right_arr);
-        JS_FreeValue(m_impl->ctx, m_impl->host.audio_avg_arr);
-        JS_FreeValue(m_impl->ctx, m_impl->host.audio_buf_arr);
-        m_impl->host.audio_buffer_built = false;
+    for (auto& slot : m_impl->host.audio_buffers) {
+        if (JS_IsUndefined(slot.object)) continue;
+        JS_FreeValue(m_impl->ctx, slot.object);
+        JS_FreeValue(m_impl->ctx, slot.left);
+        JS_FreeValue(m_impl->ctx, slot.right);
+        JS_FreeValue(m_impl->ctx, slot.average);
+        JS_FreeValue(m_impl->ctx, slot.buffer);
+        slot = AudioBufferSlot { .resolution = slot.resolution };
     }
     for (auto& d : m_impl->host.deferred) {
         if (! JS_IsUndefined(d.fn)) JS_FreeValue(m_impl->ctx, d.fn);
@@ -3620,7 +3669,7 @@ void JsRuntime::SetFrameInputs(const FrameInputs& fi) {
     // `input` for a Proxy or install setters), so this is a real entry point.
     ScriptDeadlineGuard guard(&m_impl->host, kScriptFrameBudget);
     UpdateInputObject(m_impl->ctx);
-    if (m_impl->host.audio_buffer_built) RefreshAudioBuffer(m_impl->ctx);
+    RefreshAudioBuffers(m_impl->ctx, m_impl->host);
 }
 
 void JsRuntime::SetUserProperty(std::string_view key, const Json& property) {
@@ -3639,7 +3688,8 @@ void JsRuntime::SetUserProperty(std::string_view key, const Json& property) {
         JS_DefinePropertyValueStr(
             ctx, engine, "userProperties", JS_DupValue(ctx, props), JS_PROP_C_W_E);
     }
-    JS_DefinePropertyValueStr(ctx, props, key_str.c_str(), JsonToJs(ctx, property), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(
+        ctx, props, key_str.c_str(), UserPropertyValueToJs(ctx, property), JS_PROP_C_W_E);
 
     JSValue changed = JS_NewObject(ctx);
     JS_DefinePropertyValueStr(
@@ -4086,6 +4136,15 @@ FieldScript* JsRuntime::MakeFieldScript(
     I->wrapped_layer = wrapped; // takes ownership; freed in JsRuntime dtor
     I->clone_queue   = std::move(clones);
     I->registered_assets = std::move(m_impl->host.pending_registered_assets);
+    JSValue workshop_id = JS_GetPropertyStr(ctx, ns, "__workshopId");
+    if (JS_IsString(workshop_id)) {
+        const char* value = JS_ToCString(ctx, workshop_id);
+        if (value != nullptr) {
+            I->workshop_id = value;
+            JS_FreeCString(ctx, value);
+        }
+    }
+    JS_FreeValue(ctx, workshop_id);
     for (auto& [asset, nodes] : asset_clones) {
         fs->AddAssetCloneQueue(std::move(asset), std::move(nodes));
     }

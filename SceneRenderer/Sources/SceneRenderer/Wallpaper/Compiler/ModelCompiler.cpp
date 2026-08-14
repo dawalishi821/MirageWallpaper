@@ -707,15 +707,38 @@ bool ParseAnimation(fs::MemBinaryStream& f, WPPuppet::Animation& anim, int mdla_
             uint32_t v4_count = f.ReadUint32();
             anim.v4_events.resize(v4_count);
             for (auto& ev : anim.v4_events) {
-                ev.time     = f.ReadFloat();
-                ev.flags    = f.ReadUint32();
-                uint32_t bs = f.ReadUint32();
-                if (bs % 4 != 0) {
-                    rstd_error("AnimV4Event byte_size {} not %% 4", bs);
+                ev.time              = f.ReadFloat();
+                uint16_t curve_count = f.ReadUint16();
+                ev.flags             = f.ReadUint16();
+                if (curve_count == 0) {
+                    rstd_error("AnimV4Event curve_count is zero in {}", std::string(path));
                     return false;
                 }
-                ev.values.resize(bs / 4);
-                for (auto& v : ev.values) v = f.ReadFloat();
+                if (! CountFitsInStream(f, curve_count, 4)) {
+                    rstd_error("AnimV4Event curve_count {} exceeds remaining bytes in {}",
+                               curve_count,
+                               std::string(path));
+                    return false;
+                }
+                ev.curves.resize(curve_count);
+                for (uint16_t curve_index = 0; curve_index < curve_count; ++curve_index) {
+                    auto& curve = ev.curves[curve_index];
+                    curve.id    = curve_index == 0 ? 0 : f.ReadUint16();
+                    uint32_t bs = f.ReadUint32();
+                    if (bs % 4 != 0) {
+                        rstd_error("AnimV4Curve byte_size {} not %% 4", bs);
+                        return false;
+                    }
+                    const auto value_count = bs / 4;
+                    if (! CountFitsInStream(f, value_count, 4)) {
+                        rstd_error("AnimV4Curve value count {} exceeds remaining bytes in {}",
+                                   value_count,
+                                   std::string(path));
+                        return false;
+                    }
+                    curve.values.resize(value_count);
+                    for (auto& v : curve.values) v = f.ReadFloat();
+                }
             }
         } else if (has_v4_events != 0) {
             rstd_info("Animation has_v4_events expected 0/1, got {}", has_v4_events);

@@ -276,6 +276,45 @@ ResolveImportedTextureName(const RenderSceneSnapshot& render_scene, const Textur
     return record->key;
 }
 
+inline std::shared_ptr<Image> MakeMissingTexturePlaceholder(std::string_view key) {
+    constexpr i32 size = 2;
+    auto image         = std::make_shared<Image>();
+    image->key         = std::string(key);
+    image->header.width         = size;
+    image->header.height        = size;
+    image->header.mapWidth      = size;
+    image->header.mapHeight     = size;
+    image->header.format        = TextureFormat::RGBA8;
+    image->header.type          = ImageType::PNG;
+    image->header.count         = 1;
+    image->header.sample        = TextureSample { TextureWrap::CLAMP_TO_EDGE,
+                                                   TextureWrap::CLAMP_TO_EDGE,
+                                                   TextureFilter::LINEAR,
+                                                   TextureFilter::LINEAR };
+    image->header.mipmap_pow2   = true;
+    image->header.mipmap_larger = false;
+    image->slots.resize(1);
+    auto& slot  = image->slots[0];
+    slot.width  = size;
+    slot.height = size;
+    slot.mipmaps.resize(1);
+    auto& mipmap  = slot.mipmaps[0];
+    mipmap.width  = size;
+    mipmap.height = size;
+    mipmap.size   = size * size * 4;
+    auto* pixels  = new uint8_t[static_cast<std::size_t>(mipmap.size)];
+    for (i32 i = 0; i < size * size; ++i) {
+        pixels[i * 4 + 0] = 0xFF;
+        pixels[i * 4 + 1] = 0x00;
+        pixels[i * 4 + 2] = 0xFF;
+        pixels[i * 4 + 3] = 0xFF;
+    }
+    mipmap.data = ImageDataPtr(pixels, [](uint8_t* data) {
+        delete[] data;
+    });
+    return image;
+}
+
 class ImportedTextureProvider {
 public:
     ImportedTextureProvider()          = default;
@@ -299,7 +338,12 @@ public:
 
     std::shared_ptr<Image> ParseImportedTexture(const TextureRequest& request) const override {
         if (m_image_parser == nullptr) return nullptr;
-        return m_image_parser->Parse(ResolveImportedTextureKey(request));
+        auto key = ResolveImportedTextureKey(request);
+        if (! m_image_parser->Contains(key)) {
+            rstd_warn("texture \"{}\" not found, using placeholder", key);
+            return MakeMissingTexturePlaceholder(key);
+        }
+        return m_image_parser->Parse(key);
     }
 
     std::shared_ptr<VideoPlaybackState>

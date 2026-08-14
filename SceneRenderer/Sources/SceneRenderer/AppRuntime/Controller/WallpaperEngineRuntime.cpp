@@ -125,6 +125,11 @@ struct MainSetUserPropertyDiagnosticCallback {
 struct MainUserPropertyDiagnostics {
     std::vector<SceneUserPropertyDiagnostic> diagnostics;
 };
+struct MainSceneClearColorChanged {
+    float r { 0.0f };
+    float g { 0.0f };
+    float b { 0.0f };
+};
 struct MainPreparedPassDiagnostics {
     RenderPassDiagnosticCallback                cb;
     std::vector<vulkan::PreparedPassDiagnostic> diagnostics;
@@ -134,8 +139,8 @@ struct MainMsg {
     std::variant<MainLoadScene, MainConfigure, MainSetFps, MainSetVolume, MainSetVolumeScale,
                  MainSetMuted, MainSetFillMode, MainSetSpeed, MainSetUserProperty,
                  MainSetFirstFrameCallback, MainSetUserPropertyDiagnosticCallback,
-                 MainUserPropertyDiagnostics, MainPreparedPassDiagnostics, MainStop, MainPauseAudio,
-                 MainFirstFrame>
+                 MainUserPropertyDiagnostics, MainSceneClearColorChanged,
+                 MainPreparedPassDiagnostics, MainStop, MainPauseAudio, MainFirstFrame>
         v;
 };
 
@@ -318,6 +323,15 @@ void ApplyUserPropertyToClear(Scene& scene, const std::string& key, const Json& 
     };
 }
 
+std::optional<std::array<float, 3>> ResolveUserPropertyColor(const Json& prop) {
+    auto coerced = CoerceUserPropertyValue(prop);
+    if (! coerced.ok || coerced.value.size() < 3) return std::nullopt;
+    auto clamp01 = [](float value) { return std::clamp(value, 0.0f, 1.0f); };
+    return std::array<float, 3> { clamp01(coerced.value[0]),
+                                  clamp01(coerced.value[1]),
+                                  clamp01(coerced.value[2]) };
+}
+
 // Push a user-property value to every material whose shader declared a
 // `u_*` uniform with this material-key.
 void ApplyUserPropertyToShaderUniforms(Scene& scene, const std::string& key, const Json& prop) {
@@ -395,7 +409,7 @@ ApplyUserPropertyToMaterialTextures(Scene& scene, const std::string& key, const 
     if (! texture_value.has_value()) return changed_materials;
 
     for (const auto& binding : it->second) {
-        if (binding.material == nullptr) continue;
+        if (! binding.material) continue;
         std::string next     = texture_value->empty() ? binding.fallback : *texture_value;
         auto        mutation = scene.SetMaterialTextureSlot(*binding.material, binding.slot, next);
         if (mutation.changed && mutation.material.has_value()) {
@@ -557,14 +571,12 @@ bool ApplyUserPropertyToShaderCombos(Scene& scene, const std::string& key, const
     return requires_graph_rebuild;
 }
 
-float CurrentImagePropertyAlpha(SceneNode* node) {
-    if (! node) return 1.0f;
-    return node->IsAlphaOverridden() ? node->EffectiveAlpha() : node->BaseAlpha();
+float CurrentImagePropertyAlpha(SceneNode& node) {
+    return node.IsAlphaOverridden() ? node.EffectiveAlpha() : node.BaseAlpha();
 }
 
-Eigen::Vector3f CurrentImagePropertyColor(SceneNode* node) {
-    if (! node) return { 1.0f, 1.0f, 1.0f };
-    return node->IsColorOverridden() ? node->Color() : node->BaseColor();
+Eigen::Vector3f CurrentImagePropertyColor(SceneNode& node) {
+    return node.IsColorOverridden() ? node.Color() : node.BaseColor();
 }
 
 bool MaterialHasShaderUniform(const SceneMaterial& material, std::string_view uniform_name) {
@@ -588,15 +600,16 @@ void ApplyUserPropertyToImageColor(Scene& scene, const std::string& key, const J
 
     Eigen::Vector3f color { coerced.value[0], coerced.value[1], coerced.value[2] };
     for (const auto& binding : it->second) {
-        if (binding.node) binding.node->SetColor(color);
+        auto& node = *binding.node;
+        node.SetColor(color);
 
         std::array<float, 3> color3 { color.x(), color.y(), color.z() };
-        for (auto* material : binding.materials) {
+        for (const auto& material : binding.materials) {
             if (! material) continue;
             const bool           has_user_alpha = MaterialHasShaderUniform(*material, G_USERALPHA);
-            const float          alpha          = has_user_alpha && binding.node
-                                                      ? binding.node->BaseAlpha()
-                                                      : CurrentImagePropertyAlpha(binding.node);
+            const float          alpha          = has_user_alpha
+                                                      ? node.BaseAlpha()
+                                                      : CurrentImagePropertyAlpha(node);
             std::array<float, 4> color4 { color.x(), color.y(), color.z(), alpha };
             if (MaterialHasShaderUniform(*material, G_COLOR4))
                 scene.SetMaterialShaderValue(*material, G_COLOR4, color4);
@@ -615,11 +628,12 @@ void ApplyUserPropertyToImageAlpha(Scene& scene, const std::string& key, const J
 
     const float alpha = std::clamp(coerced.value[0], 0.0f, 1.0f);
     for (const auto& binding : it->second) {
-        if (binding.node) binding.node->SetUserAlpha(alpha);
+        auto& node = *binding.node;
+        node.SetUserAlpha(alpha);
 
-        Eigen::Vector3f      color = CurrentImagePropertyColor(binding.node);
+        Eigen::Vector3f      color = CurrentImagePropertyColor(node);
         std::array<float, 4> color4 { color.x(), color.y(), color.z(), alpha };
-        for (auto* material : binding.materials) {
+        for (const auto& material : binding.materials) {
             if (! material) continue;
             const bool has_user_alpha = MaterialHasShaderUniform(*material, G_USERALPHA);
             if (has_user_alpha) scene.SetMaterialShaderValue(*material, G_USERALPHA, alpha);
@@ -921,6 +935,7 @@ public:
     void on(MainSetFirstFrameCallback&&);
     void on(MainSetUserPropertyDiagnosticCallback&&);
     void on(MainUserPropertyDiagnostics&&);
+    void on(MainSceneClearColorChanged&&);
     void on(MainPreparedPassDiagnostics&&);
     void on(MainStop&&);
     void on(MainPauseAudio&&);
@@ -934,6 +949,8 @@ public:
 private:
     void loadScene();
     void publishPreparedScene();
+    std::optional<std::array<float, 3>> schemeColor() const;
+    void publishClearColor(std::array<float, 3> fallback);
 
     bool m_inited { false };
 
@@ -1326,14 +1343,22 @@ void SceneRenderController::on(RenderSetScene&& m) {
     m_scene_ready.store(m_scene != nullptr && m_render->readyToDraw(), std::memory_order_release);
 }
 
-void SceneRenderController::on(RenderSetSpeed&& m) { m_speed = m.speed; }
+void SceneRenderController::on(RenderSetSpeed&& m) {
+    if (IsValidScenePlaybackSpeed(m.speed)) m_speed = m.speed;
+}
 
 void SceneRenderController::on(RenderSetUserProperty&& m) {
     if (! m_scene) return;
     std::string key                      = CanonicalUserPropertyKey(m.key);
     const bool  has_shader_combo_binding = m_scene->shader_combo_user_index.contains(key);
     sr::script::SetSceneUserProperty(*m_scene, key, m.property);
+    const auto previous_clear = m_scene->clearColor;
     ApplyUserPropertyToClear(*m_scene, key, m.property);
+    if (m_scene->clearColor != previous_clear && m_main_tx) {
+        const auto& color = m_scene->clearColor;
+        (void)m_main_tx->send(MainMsg { MainSceneClearColorChanged {
+            color[0], color[1], color[2] } });
+    }
     ApplyUserPropertyToShaderUniforms(*m_scene, key, m.property);
     auto texture_materials = ApplyUserPropertyToMaterialTextures(*m_scene, key, m.property);
     bool shader_combo_requires_graph = ApplyUserPropertyToShaderCombos(*m_scene, key, m.property);
@@ -1482,6 +1507,10 @@ void SceneRuntimeController::on(MainLoadScene&&) {
 }
 
 void SceneRuntimeController::on(MainConfigure&& m) {
+    if (! IsValidScenePlaybackSpeed(m.config.speed)) {
+        rstd_warn("SceneWallpaper: invalid configured playback speed; using 1");
+        m.config.speed = 1.0f;
+    }
     m_config          = std::move(m.config);
     m_render_controller->configureAudioCapture(
         m_config.spectrum_enabled, m_config.external_spectrum);
@@ -1533,6 +1562,10 @@ void SceneRuntimeController::on(MainSetFillMode&& m) {
 }
 
 void SceneRuntimeController::on(MainSetSpeed&& m) {
+    if (! IsValidScenePlaybackSpeed(m.speed)) {
+        rstd_warn("SceneWallpaper: invalid playback speed; ignoring");
+        return;
+    }
     m_config.speed = m.speed;
     (void)m_render_loop.sender().send(RenderMsg { RenderSetSpeed { m.speed } });
 }
@@ -1546,6 +1579,11 @@ void SceneRuntimeController::on(MainSetUserProperty&& m) {
                                     prop.clone());
     m_user_properties.insert(::alloc::string::String::make(rstd::cppstd::as_str(property)),
                              prop.clone());
+    if (property == kSchemeColorKey) {
+        if (auto color = ResolveUserPropertyColor(prop); color && m_clear_color_cb) {
+            m_clear_color_cb((*color)[0], (*color)[1], (*color)[2]);
+        }
+    }
     if (m_prepared_scene && m_prepared_scene_generation == m_config_generation &&
         m_submitted_scene_generation != m_config_generation) {
         // A property arriving while Vulkan is still initializing must update
@@ -1568,6 +1606,21 @@ void SceneRuntimeController::on(MainSetUserPropertyDiagnosticCallback&& m) {
 
 void SceneRuntimeController::on(MainUserPropertyDiagnostics&& m) {
     if (m_user_property_diagnostic_cb) m_user_property_diagnostic_cb(std::move(m.diagnostics));
+}
+
+std::optional<std::array<float, 3>> SceneRuntimeController::schemeColor() const {
+    auto property = m_user_properties.get(rstd::cppstd::as_str(kSchemeColorKey));
+    return property.is_some() ? ResolveUserPropertyColor(**property) : std::nullopt;
+}
+
+void SceneRuntimeController::publishClearColor(std::array<float, 3> fallback) {
+    if (! m_clear_color_cb) return;
+    auto color = schemeColor().value_or(fallback);
+    m_clear_color_cb(color[0], color[1], color[2]);
+}
+
+void SceneRuntimeController::on(MainSceneClearColorChanged&& m) {
+    if (! schemeColor().has_value() && m_clear_color_cb) m_clear_color_cb(m.r, m.g, m.b);
 }
 
 void SceneRuntimeController::on(MainPreparedPassDiagnostics&& m) {
@@ -1711,10 +1764,7 @@ void SceneRuntimeController::loadScene() {
         // Surface the parsed clear color before the scene is shipped
         // off to the render thread; downstream callers use it to keep
         // letterbox/background fill aligned with the scene.
-        if (m_clear_color_cb) {
-            const auto& c = scene->clearColor;
-            m_clear_color_cb(c[0], c[1], c[2]);
-        }
+        publishClearColor(scene->clearColor);
         if (m_audio_demand_cb) m_audio_demand_cb(scene->uses_audio_spectrum);
     }
 

@@ -58,6 +58,11 @@ static void CheckAndSetSprite(const RenderSceneSnapshot&      render_scene,
 
 struct ExtraInfo;
 
+static i32 WallpaperId(const SceneNode& node) {
+    auto wallpaper = node.WallpaperIdentity();
+    return wallpaper ? wallpaper->value : -1;
+}
+
 struct LinkTextureConsumer {
     rg::NodeID       pass_id;
     WallpaperLayerId source_layer;
@@ -189,6 +194,11 @@ static rg::TextureNodeRef AddCopyPass(ExtraInfo& extra, rg::TextureNodeRef in,
             copy = builder.createTexture(desc, true);
             rg::doCopy(builder, pdesc, in, copy);
             FillCopyTextureRequests(extra, pdesc);
+            pdesc.dst_matches_src = ! out_desc.has_value();
+            if (pdesc.dst_matches_src && pdesc.src_request) {
+                pdesc.dst_request       = *pdesc.src_request;
+                pdesc.dst_request->name = desc.key;
+            }
         });
     return copy;
 }
@@ -255,9 +265,12 @@ static void ToGraphPass(SceneNode* node, std::string_view output, i32 imgId, Ext
                        &extra](SceneImageEffectLayer* effs) {
         effs->ResolveEffect(scene.default_effect_mesh, "effect");
 
-        for (usize i = 0; i < effs->EffectCount(); i++) {
-            auto& eff = effs->GetEffect(i);
-            if (! eff || ! eff->runtime_visible) continue;
+        // ResolveEffect builds the exact render sequence: runtime-visible
+        // authored effects followed by the explicit final-resolve pass.  The
+        // latter must be emitted before GraphLinkFinalizer captures/publishes
+        // this layer's last output version.
+        for (auto* eff : effs->ResolvedEffects()) {
+            if (eff == nullptr) continue;
             auto cmdItor = eff->commands.begin();
             auto cmdEnd  = eff->commands.end();
             int  nodePos = 0;
@@ -269,7 +282,8 @@ static void ToGraphPass(SceneNode* node, std::string_view output, i32 imgId, Ext
                 }
                 auto& name = n.output;
                 ToGraphPass(
-                    n.sceneNode.as_ptr(), name, node->ID(), extra, false, render_view, alpha_mode);
+                    n.sceneNode.as_ptr(), name, WallpaperId(*node), extra, false, render_view,
+                    alpha_mode);
                 nodePos++;
             }
         }
@@ -302,7 +316,7 @@ static void ToGraphPass(SceneNode* node, std::string_view output, i32 imgId, Ext
                 prefill.output.empty() ? output : std::string_view(prefill.output);
             ToGraphPass(prefill.sceneNode.as_ptr(),
                         prefill_output,
-                        node->ID(),
+                        WallpaperId(*node),
                         extra,
                         false,
                         render_view,
@@ -447,10 +461,12 @@ static void ToGraphPass(SceneNode* node, std::string_view output, i32 imgId, Ext
 static bool CollectEmitSkipSubtrees(SceneNode* node, Scene& scene, const Set<i32>& linked_ids,
                                     Set<const SceneNode*>& out_skip,
                                     bool                   visibility_hidden_ancestor = false) {
-    const i32  nid    = node->ID();
+    const i32  nid    = WallpaperId(*node);
     const bool linked = nid >= 0 && linked_ids.count(nid) != 0;
     const bool visibility_hidden_self =
-        nid >= 0 && scene.visibility_elidable_layer_ids.count(nid) != 0 && ! linked;
+        (! node->Visible() ||
+         (nid >= 0 && scene.visibility_elidable_layer_ids.count(nid) != 0)) &&
+        ! linked;
     const bool visibility_hidden = visibility_hidden_ancestor || visibility_hidden_self;
 
     bool all_children_skippable = true;
@@ -494,7 +510,7 @@ static void EmitPlanarReflectionNode(SceneNode* node, ExtraInfo& extra,
     if (node->Reflected() && ! SamplesPlanarReflection(*node)) {
         ToGraphPass(node,
                     WE_REFLECTION_PREFIX,
-                    node->ID(),
+                    WallpaperId(*node),
                     extra,
                     true,
                     SceneRenderViewKind::Reflection);
@@ -530,7 +546,7 @@ std::unique_ptr<rg::RenderGraph> sr::sceneToRenderGraph(Scene&                  
     // layers without a link consumer fall through and emit nothing.
     TraverseNode(
         [&extra, &scene, &linked_ids](SceneNode* node) {
-            const i32  nid      = node->ID();
+            const i32  nid      = WallpaperId(*node);
             const bool elidable = scene.elidable_layer_ids.count(nid) != 0;
             const bool linked   = linked_ids.count(nid) != 0;
             SceneImageEffectLayer* image_effect { nullptr };
@@ -573,7 +589,7 @@ std::unique_ptr<rg::RenderGraph> sr::sceneToRenderGraph(Scene&                  
             if (auto* sp = std::get_if<ScenePostProcessPass>(&step)) {
                 std::string_view target =
                     sp->output.empty() ? SpecTex_Default : std::string_view(sp->output);
-                ToGraphPass(sp->node.as_ptr(), target, sp->node->ID(), extra);
+                ToGraphPass(sp->node.as_ptr(), target, WallpaperId(*sp->node), extra);
             } else if (auto* cp = std::get_if<ScenePostProcessCopy>(&step)) {
                 AddCopyPass(extra, MakeTextureDesc(cp->src), MakeTextureDesc(cp->dst));
             }

@@ -371,6 +371,119 @@ void TestDynamicLayerCompatibility() {
           "initial configs and serialized configuration layers retain authored values");
 }
 
+void TestDynamicLayerOrdering() {
+    sr::Scene scene;
+    auto      ring = rstd::sync::Arc<sr::SceneNode>::make(
+        Eigen::Vector3f::Zero(), Eigen::Vector3f::Ones(), Eigen::Vector3f::Zero(), "ring");
+    auto body = rstd::sync::Arc<sr::SceneNode>::make(
+        Eigen::Vector3f::Zero(), Eigen::Vector3f::Ones(), Eigen::Vector3f::Zero(), "body");
+    scene.AttachRuntimeNode(*scene.sceneGraph, ring.clone());
+    scene.AttachRuntimeNode(*scene.sceneGraph, body.clone());
+    (void)scene.ConsumeRenderGraphDirty();
+
+    std::vector<rstd::sync::Arc<sr::SceneNode>> created;
+    sr::script::JsRuntime                       runtime;
+    runtime.SetScene(&scene);
+    runtime.SetLayerFactory([&scene, &created](sr::SceneNode*, sr::script::LayerAssetReference asset) {
+        if (asset.path != "models/bar.json")
+            return std::optional<rstd::sync::Arc<sr::SceneNode>> {};
+        auto node = rstd::sync::Arc<sr::SceneNode>::make();
+        scene.AttachRuntimeNode(*scene.sceneGraph, node.clone());
+        created.push_back(node.clone());
+        return std::optional<rstd::sync::Arc<sr::SceneNode>>(std::move(node));
+    });
+    auto* script = runtime.MakeFieldScript(
+        R"JS(
+            engine.registerAsset('models/bar.json');
+            let result = -1;
+            export function init() {
+                const target = thisScene.getLayerIndex(thisLayer);
+                const first = thisScene.createLayer('models/bar.json');
+                thisScene.sortLayer(first, target);
+                const second = thisScene.createLayer('models/bar.json');
+                thisScene.sortLayer(second, target);
+                result = thisScene.getLayerIndex(first) * 1000
+                       + thisScene.getLayerIndex(second) * 100
+                       + thisScene.getLayerIndex(thisLayer) * 10
+                       + thisScene.getLayerIndex('body');
+            }
+            export function update() { return result; }
+        )JS",
+        "test/dynamic_layer_ordering",
+        sr::script::FieldKind::Scalar,
+        Parse("{}"),
+        Parse("0"),
+        ring.as_ptr());
+    Check(script != nullptr, "dynamic layer ordering script compiles");
+    if (! script) return;
+
+    runtime.SetSceneRoot(scene.sceneGraph.as_ptr());
+    runtime.TickAll();
+    runtime.ClearLayerFactory();
+
+    Check(created.size() == 2, "dynamic layer factory creates both requested layers");
+    if (created.size() != 2) return;
+    const auto& children = scene.sceneGraph->GetChildren();
+    auto it = children.begin();
+    bool order_ok = children.size() == 4;
+    if (order_ok) {
+        order_ok = it++->as_ptr() == created[1].as_ptr();
+        order_ok = order_ok && it++->as_ptr() == created[0].as_ptr();
+        order_ok = order_ok && it++->as_ptr() == ring.as_ptr();
+        order_ok = order_ok && it->as_ptr() == body.as_ptr();
+    }
+    Check(order_ok, "sortLayer restores the requested sibling draw order");
+    const auto* result = std::get_if<sr::script::ScalarValue>(&script->last_value());
+    Check(result && result->v == 1023.0,
+          "getLayerIndex observes reordered layers by object and by name");
+    Check(scene.ConsumeRenderGraphDirty(), "dynamic layer sorting invalidates the render graph");
+}
+
+void TestWorkshopLayerAssetReference() {
+    sr::script::JsRuntime runtime;
+    auto                  owner = rstd::sync::Arc<sr::SceneNode>::make();
+    std::vector<std::string> paths;
+    std::vector<std::string> workshop_ids;
+    std::vector<rstd::sync::Arc<sr::SceneNode>> created;
+    runtime.SetLayerFactory(
+        [&paths, &workshop_ids, &created](sr::SceneNode*, sr::script::LayerAssetReference asset) {
+            paths.emplace_back(asset.path);
+            workshop_ids.emplace_back(asset.workshop_id.value_or(std::string_view {}));
+            auto node = rstd::sync::Arc<sr::SceneNode>::make();
+            created.push_back(node.clone());
+            return std::optional<rstd::sync::Arc<sr::SceneNode>>(std::move(node));
+        });
+    auto* script = runtime.MakeFieldScript(
+        R"JS(
+            export let __workshopId = '2652493753';
+            let result = 0;
+            export function init() {
+                for (let i = 0; i < 12; ++i) {
+                    if (thisScene.createLayer('models/bar.json')) ++result;
+                }
+            }
+            export function update() { return result; }
+        )JS",
+        "test/workshop_layer_asset_reference",
+        sr::script::FieldKind::Scalar,
+        Parse("{}"),
+        Parse("0"),
+        owner.as_ptr());
+    Check(script != nullptr, "workshop layer script compiles without registerAsset");
+    if (! script) return;
+    runtime.SetSceneRoot(owner.as_ptr());
+    runtime.TickAll();
+    runtime.ClearLayerFactory();
+    Check(created.size() == 12 && paths.size() == 12 && workshop_ids.size() == 12,
+          "direct workshop createLayer requests use the dynamic factory without fixed capacity");
+    Check(! paths.empty() && paths.front() == "models/bar.json" &&
+              workshop_ids.front() == "2652493753",
+          "createLayer forwards the authored path and module workshop id");
+    const auto* result = std::get_if<sr::script::ScalarValue>(&script->last_value());
+    Check(result && result->v == 12.0,
+          "all direct workshop createLayer calls complete successfully");
+}
+
 void TestParticleInstanceCompatibility() {
     struct OverrideState {
         float                 alpha { 1.0f };
@@ -628,6 +741,83 @@ void TestCursorClickOrder() {
           "release outside the pressed node does not dispatch cursorClick");
 }
 
+void TestPrimitiveEngineUserPropertyValues() {
+    sr::script::JsRuntime runtime;
+    auto* script = runtime.MakeFieldScript(
+        R"JS(
+            export function update() {
+                return engine.userProperties.quality === 2 &&
+                       engine.userProperties.enabled === true ? 1 : 0;
+            }
+        )JS",
+        "test/primitive_engine_user_properties",
+        sr::script::FieldKind::Scalar,
+        Parse("{}"),
+        Parse("0"));
+    Check(script != nullptr, "primitive user-property script compiles");
+    if (! script) return;
+
+    runtime.SetUserProperty("quality", Parse(R"({"type":"combo","value":2})"));
+    runtime.SetUserProperty("enabled", Parse(R"({"type":"bool","value":true})"));
+    runtime.TickAll();
+    const auto* value = std::get_if<sr::script::ScalarValue>(&script->last_value());
+    Check(value && value->v == 1.0,
+          "engine.userProperties exposes unwrapped primitive descriptor values");
+}
+
+void TestMixedAudioBufferResolutions() {
+    sr::script::JsRuntime    runtime;
+    sr::script::FrameInputs input;
+    for (std::size_t i = 0; i < input.audio_average.size(); ++i)
+        input.audio_average[i] = static_cast<float>(100 + i);
+    runtime.SetFrameInputs(input);
+
+    auto* low = runtime.MakeFieldScript(
+        R"JS(
+            const audio = engine.registerAudioBuffers(16);
+            export function update() {
+                return audio.average.length * 1000 + audio.average[15];
+            }
+        )JS",
+        "test/audio_buffers_mixed_low",
+        sr::script::FieldKind::Scalar,
+        Parse("{}"),
+        Parse("0"));
+    auto* full = runtime.MakeFieldScript(
+        R"JS(
+            const audio = engine.registerAudioBuffers(64);
+            export function update() {
+                return audio.average.length * 1000 + audio.average[63];
+            }
+        )JS",
+        "test/audio_buffers_mixed_full",
+        sr::script::FieldKind::Scalar,
+        Parse("{}"),
+        Parse("0"));
+    Check(low != nullptr && full != nullptr,
+          "mixed audio buffer resolution scripts compile");
+    if (! low || ! full) return;
+
+    runtime.TickAll();
+    const auto* low_first = std::get_if<sr::script::ScalarValue>(&low->last_value());
+    const auto* full_first = std::get_if<sr::script::ScalarValue>(&full->last_value());
+    Check(low_first && std::abs(low_first->v - 16161.5) < 0.001,
+          "16-bin audio buffer keeps its independent resolution");
+    Check(full_first && std::abs(full_first->v - 64163.0) < 0.001,
+          "64-bin audio buffer keeps its independent resolution");
+
+    for (std::size_t i = 0; i < input.audio_average.size(); ++i)
+        input.audio_average[i] = static_cast<float>(200 + i);
+    runtime.SetFrameInputs(input);
+    runtime.TickAll();
+    const auto* low_second = std::get_if<sr::script::ScalarValue>(&low->last_value());
+    const auto* full_second = std::get_if<sr::script::ScalarValue>(&full->last_value());
+    Check(low_second && std::abs(low_second->v - 16261.5) < 0.001,
+          "16-bin audio cache refreshes without changing shape");
+    Check(full_second && std::abs(full_second->v - 64263.0) < 0.001,
+          "64-bin audio cache refreshes without changing shape");
+}
+
 } // namespace
 
 int main() {
@@ -641,10 +831,14 @@ int main() {
     TestColorPropertyCoercion();
     TestFullwidthSemicolonNormalization();
     TestDynamicLayerCompatibility();
+    TestDynamicLayerOrdering();
+    TestWorkshopLayerAssetReference();
     TestParticleInstanceCompatibility();
     TestEffectAndMaterialCompatibility();
     TestTimelineAnimationCompatibility();
     TestCursorClickOrder();
+    TestPrimitiveEngineUserPropertyValues();
+    TestMixedAudioBufferResolutions();
     if (g_failures == 0) std::cout << "ScriptCompatibilityRegression: ok\n";
     return g_failures == 0 ? 0 : 1;
 }

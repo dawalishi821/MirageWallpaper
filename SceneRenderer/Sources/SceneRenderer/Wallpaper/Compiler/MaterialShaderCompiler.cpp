@@ -598,6 +598,36 @@ inline std::string NormalizePackedAudioSpectrumAccess(std::string_view src) {
     return out;
 }
 
+inline std::string NormalizeLeadingIntegerMulLiteral(std::string_view src) {
+    shader_lex::Lexer lx(src);
+    std::string       out;
+    std::size_t       copied = 0;
+    bool              changed = false;
+    for (;;) {
+        auto name = lx.Next();
+        if (name.kind == shader_lex::TokenKind::Eof) break;
+        if (name.kind != shader_lex::TokenKind::Ident || name.text != "mul") continue;
+        auto save    = lx.Save();
+        auto open    = NextShaderToken(lx);
+        auto literal = PunctIs(open, '(') ? NextShaderToken(lx) : shader_lex::Token {};
+        auto comma = literal.kind == shader_lex::TokenKind::Int ? NextShaderToken(lx)
+                                                                 : shader_lex::Token {};
+        if (! PunctIs(open, '(') || literal.kind != shader_lex::TokenKind::Int ||
+            ! PunctIs(comma, ',')) {
+            lx.Restore(save);
+            continue;
+        }
+        const auto literal_end = literal.offset + literal.text.size();
+        out.append(src, copied, literal_end - copied);
+        out.append(".0");
+        copied  = literal_end;
+        changed = true;
+    }
+    if (! changed) return std::string(src);
+    out.append(src, copied, std::string::npos);
+    return out;
+}
+
 inline bool IsLocalMatrixConstructor(std::string_view name) {
     return name == "mat2" || name == "mat3" || name == "mat4" || name == "mat2x2" ||
            name == "mat2x3" || name == "mat2x4" || name == "mat3x2" || name == "mat3x3" ||
@@ -1001,12 +1031,8 @@ inline std::string Preprocessor(const std::string& in_src, ShaderType type, cons
 
     // GS source uses `in`/`out` storage classes; VS/FS use `attribute`/`varying`.
     ForEachDeclLine(src, { "attribute", "varying", "in", "out" }, [&](const DeclMatch& m) {
-        // attribute-in-vertex and varying-in-fragment both behave as inputs;
-        // varying-in-vertex behaves as output. GS: `in` is input (from VS),
-        // `out` is output (to FS).
-        bool        is_input = (m.storage == "attribute") ||
-                               (m.storage == "varying" && type == ShaderType::FRAGMENT) ||
-                               (m.storage == "in" && type == ShaderType::GEOMETRY);
+        bool        is_input = (m.storage == "attribute") || (m.storage == "in") ||
+                               (m.storage == "varying" && type == ShaderType::FRAGMENT);
         std::string line(src.substr(m.start, m.end - m.start));
         std::string name(m.name);
         if (is_input)
@@ -1150,6 +1176,84 @@ inline std::string StripUniforms(const std::string& src) {
         cursor = m.end;
     });
     out.append(src, cursor, std::string::npos);
+    return out;
+}
+
+inline bool IsGlobalVariableQualifier(std::string_view token) {
+    return token == "const" || token == "precise" || token == "row_major" ||
+           token == "column_major" || token == "static";
+}
+
+inline std::string QualifyGlobalVariablesForHlsl(const std::string& src) {
+    shader_lex::Lexer  lexer(src);
+    std::vector<std::size_t> insertions;
+    int  brace_depth = 0;
+    bool statement_start = true;
+    bool directive = false;
+    for (;;) {
+        auto token = lexer.Next();
+        if (token.kind == shader_lex::TokenKind::Eof) break;
+        if (token.kind == shader_lex::TokenKind::Newline) {
+            directive = false;
+            continue;
+        }
+        if (directive || token.kind == shader_lex::TokenKind::HSpace ||
+            token.kind == shader_lex::TokenKind::LineComment ||
+            token.kind == shader_lex::TokenKind::BlockComment)
+            continue;
+        if (token.kind == shader_lex::TokenKind::Hash && brace_depth == 0) {
+            directive = true;
+            continue;
+        }
+        if (PunctIs(token, '{')) {
+            ++brace_depth;
+            statement_start = false;
+            continue;
+        }
+        if (PunctIs(token, '}')) {
+            if (brace_depth > 0) --brace_depth;
+            statement_start = brace_depth == 0;
+            continue;
+        }
+        if (brace_depth != 0) continue;
+        if (PunctIs(token, ';')) {
+            statement_start = true;
+            continue;
+        }
+        if (! statement_start || token.kind != shader_lex::TokenKind::Ident) continue;
+        if (token.text == SHADER_PLACEHOLD) continue;
+        statement_start = false;
+        const auto declaration_start = token.offset;
+        const auto probe = lexer.Save();
+        bool has_static = false;
+        bool variable = false;
+        auto type = token;
+        while (type.kind == shader_lex::TokenKind::Ident &&
+               IsGlobalVariableQualifier(type.text)) {
+            has_static = has_static || type.text == "static";
+            type = NextShaderToken(lexer);
+        }
+        if (type.kind == shader_lex::TokenKind::Ident) {
+            auto name = NextShaderToken(lexer);
+            if (name.kind == shader_lex::TokenKind::Ident) {
+                auto suffix = NextShaderToken(lexer);
+                variable = PunctIs(suffix, ';') || PunctIs(suffix, '=') ||
+                           PunctIs(suffix, '[') || PunctIs(suffix, ',') ||
+                           PunctIs(suffix, ':');
+            }
+        }
+        lexer.Restore(probe);
+        if (variable && ! has_static) insertions.push_back(declaration_start);
+    }
+    if (insertions.empty()) return src;
+    std::string out;
+    std::size_t copied = 0;
+    for (auto offset : insertions) {
+        out.append(src, copied, offset - copied);
+        out.append("static ");
+        copied = offset;
+    }
+    out.append(src, copied, std::string::npos);
     return out;
 }
 
@@ -1581,7 +1685,7 @@ Finalprocessor(const WPShaderUnit& unit, const WPPreprocessorInfo* pre,
     // inout TriangleStream<WW_PSIn> OUT`.
     if (unit.stage == ShaderType::GEOMETRY) {
         auto [io_decls, stripped] = ScanAndStripIO(unit.src);
-        std::string body          = StripUniforms(stripped);
+        std::string body          = QualifyGlobalVariablesForHlsl(StripUniforms(stripped));
 
         std::vector<IODecl> in_decls, out_decls;
         auto add_to = [](std::vector<IODecl>& v,
@@ -1649,26 +1753,28 @@ Finalprocessor(const WPShaderUnit& unit, const WPPreprocessorInfo* pre,
 
     // Strip non-sampler `uniform TYPE NAME;` lines too; re-emitted as
     // members of a cross-stage UBO `ww_Uniforms` at (set=0, binding=0).
-    std::string stage3 = StripUniforms(stage2);
+    std::string stage3 = QualifyGlobalVariablesForHlsl(StripUniforms(stage2));
 
     // Partition IO declarations into attributes and varyings. The producing
     // stage owns each cross-stage type; consumers only add missing names.
     std::vector<IODecl> attrs, varyings;
     auto add = [&](const IODecl& d,
                    IODeclPrecedence precedence = IODeclPrecedence::KeepExisting) {
-        std::vector<IODecl>& declarations = d.storage == 'a' ? attrs : varyings;
+        const bool vertex_input =
+            unit.stage == ShaderType::VERTEX && (d.storage == 'a' || d.storage == 'i');
+        std::vector<IODecl>& declarations = vertex_input ? attrs : varyings;
         AddIODecl(declarations, d, precedence);
     };
     for (const auto& d : io_decls) add(d);
-    auto add_from_line = [&](const std::string& line, IODeclPrecedence precedence) {
-        if (auto d = ParseIODecl(line); d) add(*d, precedence);
+    auto add_varying_from_line = [&](const std::string& line, IODeclPrecedence precedence) {
+        if (auto d = ParseIODecl(line); d) AddIODecl(varyings, *d, precedence);
     };
     if (unit.stage == ShaderType::VERTEX && next) {
         for (auto& [k, v] : next->input)
-            add_from_line(v, IODeclPrecedence::KeepExisting);
+            add_varying_from_line(v, IODeclPrecedence::KeepExisting);
     } else if (unit.stage == ShaderType::FRAGMENT && pre) {
         for (auto& [k, v] : pre->output)
-            add_from_line(v, IODeclPrecedence::PreferIncoming);
+            add_varying_from_line(v, IODeclPrecedence::PreferIncoming);
     }
 
     // Synthesize the HLSL entry point: static globals for every attr /
@@ -1727,7 +1833,7 @@ Finalprocessor(const WPShaderUnit& unit, const WPPreprocessorInfo* pre,
 
 inline std::string GenSha1(std::span<const WPShaderUnit> units) {
     static constexpr std::string_view kShaderCacheSalt {
-        "SceneRenderer-HLSL-MoltenVK-rect-matrix-v3"
+        "SceneRenderer-HLSL-MoltenVK-rect-matrix-v4"
     };
     std::string shas(kShaderCacheSalt);
     for (auto& unit : units) {
@@ -1762,17 +1868,15 @@ inline bool LoadShaderFromFile(std::vector<ShaderCode>& codes, fs::IBinaryStream
     return true;
 }
 
-inline void SaveShaderToFile(std::span<const ShaderCode> codes, fs::IBinaryStreamW& file) {
+inline bool SaveShaderToFile(std::span<const ShaderCode> codes, fs::IBinaryStreamW& file) {
     char nop[256] { '\0' };
 
-    WriteShaderCacheVersion(file, 1);
-    file.WriteUint32((u32)codes.size());
+    if (! WriteShaderCacheVersion(file, 1) || ! file.WriteUint32((u32)codes.size())) return false;
     for (const auto& c : codes) {
         u32 size = (u32)c.size() * 4;
-        file.WriteUint32(size);
-        file.Write((const char*)c.data(), size);
+        if (! file.WriteUint32(size) || ! file.WriteAll(c.data(), size)) return false;
     }
-    file.Write(nop, sizeof(nop));
+    return file.WriteAll(nop, sizeof(nop));
 }
 
 } // namespace
@@ -1826,8 +1930,8 @@ std::string WPShaderParser::PreShaderHeader(const std::string& src, const Combos
         compatible.replace(pos, 3, ";");
         ++pos;
     }
-    const std::string user_src = NormalizeLocalMatrixMul(NormalizePackedAudioSpectrumAccess(
-        UndefBeforeConflictingMacroDefines(compatible)));
+    const std::string user_src = NormalizeLocalMatrixMul(NormalizeLeadingIntegerMulLiteral(
+        NormalizePackedAudioSpectrumAccess(UndefBeforeConflictingMacroDefines(compatible))));
 
     // All stages route through glslang's HLSL frontend.
     std::string pre;
@@ -2097,9 +2201,10 @@ bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderU
             }
         } else {
             if (! compile(units, codes)) return false;
-            if (auto cache_file = vfs.OpenW(cache_file_path); cache_file) {
-                ::SaveShaderToFile(codes, *cache_file);
-            }
+            if (! vfs.Publish(cache_file_path, [&codes](fs::IBinaryStreamW& cache_file) {
+                    return ::SaveShaderToFile(codes, cache_file);
+                }))
+                rstd_warn("publish shader cache '{}' failed", cache_file_path);
         }
         SaveProcessShaderCache(std::move(process_cache_key), units, codes);
         return true;

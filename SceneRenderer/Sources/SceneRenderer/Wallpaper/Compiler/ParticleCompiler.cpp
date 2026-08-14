@@ -214,26 +214,20 @@ ParticleInitOp WPParticleParser::genParticleInitOp(const Json& wpj) {
     };
 }
 
-ParticleInitOp
-WPParticleParser::genOverrideInitOp(std::shared_ptr<const wpscene::ParticleInstanceoverride> over) {
-    return [over = std::move(over)](Particle& p, double) {
-        PM::MutiplyInitLifeTime(p, over->lifetime);
-        PM::MutiplyInitAlpha(p, UiScalarToLinear(over->alpha));
-        PM::MutiplyInitSize(p, over->size);
-        PM::MutiplyVelocity(p, over->speed);
-        if (over->overColor) {
+ParticleInitOp WPParticleParser::genOverrideInitOp(ParticleInstanceModifiers modifiers) {
+    return [modifiers](Particle& p, double) {
+        PM::MutiplyInitLifeTime(p, modifiers.Lifetime());
+        PM::MutiplyInitAlpha(p, UiScalarToLinear(modifiers.Alpha()));
+        PM::MutiplyInitSize(p, modifiers.Size());
+        PM::MutiplyVelocity(p, modifiers.Speed());
+        p.angularVelocity *= modifiers.Speed();
+        if (modifiers.HasColorOverride()) {
+            const auto& color = modifiers.Color();
+            const float scale = modifiers.UsesLegacyColor() ? 1.0f / 255.0f : 1.0f;
             PM::InitColor(p,
-                          UiColorToLinear(over->color[0] / 255.0f),
-                          UiColorToLinear(over->color[1] / 255.0f),
-                          UiColorToLinear(over->color[2] / 255.0f));
-        } else if (over->overColorn) {
-            // `colorn` = "color (normalized)" -> absolute 0..1 RGB override
-            // (matches WE editor behaviour: picking red in the UI yields a
-            // red trail regardless of the base colorrandom initializer).
-            PM::InitColor(p,
-                          UiColorToLinear(over->colorn[0]),
-                          UiColorToLinear(over->colorn[1]),
-                          UiColorToLinear(over->colorn[2]));
+                          UiColorToLinear(color[0] * scale),
+                          UiColorToLinear(color[1] * scale),
+                          UiColorToLinear(color[2] * scale));
         }
     };
 }
@@ -454,8 +448,8 @@ struct ControlPointForce {
     };
 };
 
-ParticleOperatorOp WPParticleParser::genParticleOperatorOp(
-    const Json& wpj, std::shared_ptr<const wpscene::ParticleInstanceoverride> over_state) {
+ParticleOperatorOp WPParticleParser::genParticleOperatorOp(const Json& wpj,
+                                                           ParticleInstanceModifiers modifiers) {
     do {
         if (wpj.get("name").is_none()) break;
         std::string name;
@@ -475,8 +469,8 @@ ParticleOperatorOp WPParticleParser::genParticleOperatorOp(
             // Euler for any force op listed after `movement` in the JSON
             // (e.g. controlpointattract), which diverges in central force
             // fields and makes orbital trails wobble apart.
-            return [drag, vecG, over_state](const ParticleInfo& info) {
-                auto speed = over_state->speed;
+            return [drag, vecG, modifiers](const ParticleInfo& info) {
+                auto speed = modifiers.Speed();
                 for (auto& p : info.particles) {
                     Vector3d world_velocity =
                         info.world_from_local_dir * PM::GetVelocity(p).cast<double>();
@@ -501,8 +495,8 @@ ParticleOperatorOp WPParticleParser::genParticleOperatorOp(
             };
         } else if (name == "sizechange") {
             auto vc = ValueChange::ReadFromJson(wpj);
-            return [vc, over_state](const ParticleInfo& info) {
-                auto size_over = over_state->size;
+            return [vc, modifiers](const ParticleInfo& info) {
+                auto size_over = modifiers.Size();
                 for (auto& p : info.particles)
                     PM::MutiplySize(p, size_over * FadeValueChange(PM::LifetimePos(p), vc));
             };
@@ -589,7 +583,7 @@ ParticleOperatorOp WPParticleParser::genParticleOperatorOp(
                 for (auto& p : info.particles) {
                     Vector3d pos = PM::GetPos(p).cast<double>();
                     pos.x() += phase + tur.timescale * info.time;
-                    Vector3d result = speed * over_state->speed *
+                    Vector3d result = speed * modifiers.Speed() *
                                       algorism::CurlNoise(pos * tur.scale * 2).normalized();
                     for (usize i = 0; i < 3; i++) {
                         if (tur.mask[i] == 0) result[i] = 0;

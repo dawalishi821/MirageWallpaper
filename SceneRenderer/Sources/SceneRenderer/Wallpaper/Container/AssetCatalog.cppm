@@ -28,10 +28,10 @@ int32_t ReadAssetVersion(std::string_view prefix, fs::IBinaryStream& file) {
     return slot;
 }
 
-void WriteAssetVersion(std::string_view prefix, fs::IBinaryStreamW& file, int ver) {
+bool WriteAssetVersion(std::string_view prefix, fs::IBinaryStreamW& file, int ver) {
     char buf[9] { '\0' };
     std::snprintf(buf, sizeof(buf), "%.4s%.4d", prefix.data(), ver);
-    file.Write(buf, sizeof(buf));
+    return file.WriteAll(buf, sizeof(buf));
 }
 
 int32_t ReadTexVersion(fs::IBinaryStream& file) { return ReadAssetVersion("TEX", file); }
@@ -39,8 +39,8 @@ int32_t ReadMdlVersion(fs::IBinaryStream& file) { return ReadAssetVersion("MDL",
 
 // DIY
 int32_t ReadShaderCacheVersion(fs::IBinaryStream& file) { return ReadAssetVersion("SPV", file); }
-void    WriteShaderCacheVersion(fs::IBinaryStreamW& file, int ver) {
-    WriteAssetVersion("SPVS", file, ver);
+bool    WriteShaderCacheVersion(fs::IBinaryStreamW& file, int ver) {
+    return WriteAssetVersion("SPVS", file, ver);
 }
 
 } // namespace sr

@@ -80,3 +80,26 @@ SceneNode* SceneNode::FindByName(std::string_view name) {
     }
     return nullptr;
 }
+
+std::optional<std::size_t> SceneNode::ChildIndex(const SceneNode& child) const {
+    std::size_t index = 0;
+    for (const auto& candidate : m_children) {
+        if (candidate.as_ptr() == &child) return index;
+        ++index;
+    }
+    return std::nullopt;
+}
+
+bool SceneNode::MoveChild(SceneNode& child, std::size_t index) {
+    if (index >= m_children.size()) return false;
+    auto current = ChildIndex(child);
+    if (! current || *current == index) return false;
+
+    auto moving = m_children.begin();
+    std::advance(moving, static_cast<std::ptrdiff_t>(*current));
+    auto destination = m_children.begin();
+    const auto destination_index = *current < index ? index + 1 : index;
+    std::advance(destination, static_cast<std::ptrdiff_t>(destination_index));
+    m_children.splice(destination, m_children, moving);
+    return true;
+}

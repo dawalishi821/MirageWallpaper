@@ -1098,6 +1098,7 @@ bool VulkanRender::Impl::acquireUploadCommandSlot(RenderingResources& rr, std::s
         }
         if (counter < wait_value) {
             res = rr.sem_upload.Wait(wait_value, vk_wait_time);
+            if (res == VK_TIMEOUT) return false;
             if (res != VK_SUCCESS) {
                 fail(res);
                 return false;
@@ -1208,6 +1209,7 @@ bool VulkanRender::Impl::waitForPendingUploads() {
     auto& rr = m_rendering_resources;
     if (rr.pending_upload_value == 0) return true;
     const VkResult res = rr.sem_upload.Wait(rr.pending_upload_value, vk_wait_time);
+    if (res == VK_TIMEOUT) return false;
     if (res != VK_SUCCESS) {
         fail(res);
         return false;

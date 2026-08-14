@@ -128,13 +128,18 @@ struct PerformancePage: SettingsPage {
                         }
                     Text(String(format: "%.0f", viewModel.settings.fps))
                         .frame(width: 30).monospacedDigit()
-                    if viewModel.settings.fps > 60 {
-                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
-                            .help("过高的帧率会显著增加耗电与占用。")
-                    } else if viewModel.settings.fps > 30 {
-                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
-                            .help("较高的帧率会增加耗电。")
+                    ZStack {
+                        if viewModel.settings.fps > 60 {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.red)
+                                .help("过高的帧率会显著增加耗电与占用。")
+                        } else if viewModel.settings.fps > 30 {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.yellow)
+                                .help("较高的帧率会增加耗电。")
+                        }
                     }
+                    .frame(width: 17, height: 15)
                 }
 
                 Toggle("启用音频频谱（场景与网页壁纸）", isOn: $viewModel.settings.enableSpectrum)

@@ -3,6 +3,7 @@ import rstd.cppstd;
 import sr.fs;
 import sr.json;
 import :field_binding;
+import :visibility_binding;
 
 export namespace sr
 
@@ -153,6 +154,7 @@ enum class SceneObjectKind
     Unknown,
     Container,
     Image,
+    Shape,
     Particle,
     Sound,
     Light,
@@ -166,10 +168,18 @@ public:
     SceneObjectKind                     kind { SceneObjectKind::Unknown };
     std::size_t                         raw_index { 0 };
     std::int32_t                        id { 0 };
+    bool                                has_id { false };
     std::string                         name;
     bool                                visible { true };
+    VisibleUserBinding                  visible_user;
     std::uint32_t                       parent { 0 };
+    bool                                solid { false };
     std::optional<std::array<float, 2>> size;
+};
+
+struct SceneObjectRecord {
+    SceneObjectMetadata metadata;
+    sr::Json            authored;
 };
 
 class SceneDocument {
@@ -177,8 +187,11 @@ public:
     sr::Json                        root_json;
     SceneMetadata                    metadata;
     std::vector<SceneObjectMetadata> objects_metadata;
+    std::vector<SceneObjectRecord>   objects;
+    bool                             objects_are_array { true };
 };
 
+std::optional<SceneDocument> ParseSceneDocumentValue(sr::Json, SceneVersion);
 std::optional<SceneDocument> ParseSceneDocumentJson(std::string_view, SceneVersion);
 std::optional<SceneDocument> LoadSceneDocumentFromVfs(fs::VFS&, std::string_view, SceneVersion);
 std::optional<SceneDocument> LoadSceneDocumentFromPkg(std::string_view);

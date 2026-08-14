@@ -31,8 +31,12 @@ PassInvalidationFlags CopyPass::finalizeResourceRequests(Scene& scene) {
         request && SetTextureRequestIfChanged(m_desc.src_request, std::move(request))) {
         flags |= ToPassInvalidationFlags(PassInvalidation::Resources);
     }
-    if (auto request = refresh(m_desc.dst);
-        request && SetTextureRequestIfChanged(m_desc.dst_request, std::move(request))) {
+    auto dst_request = refresh(m_desc.dst);
+    if (m_desc.dst_matches_src && m_desc.src_request) {
+        dst_request       = *m_desc.src_request;
+        dst_request->name = m_desc.dst;
+    }
+    if (dst_request && SetTextureRequestIfChanged(m_desc.dst_request, std::move(dst_request))) {
         flags |= ToPassInvalidationFlags(PassInvalidation::Resources);
     }
     return flags;

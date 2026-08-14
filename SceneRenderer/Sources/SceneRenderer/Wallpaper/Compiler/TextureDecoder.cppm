@@ -94,6 +94,7 @@ public:
     TextureAssetDecoder(fs::VFS* vfs): m_vfs(vfs) {}
     virtual ~TextureAssetDecoder() = default;
 
+    bool                   Contains(const std::string&) const override;
     std::shared_ptr<Image> Parse(const std::string&) override;
     ImageHeader            ParseHeader(const std::string&) override;
 

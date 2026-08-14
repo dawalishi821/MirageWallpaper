@@ -183,6 +183,8 @@ SceneObjectKind object_kind(const sr::Json& obj) {
     if (! obj.is_object()) return SceneObjectKind::Unknown;
     if (auto value = obj.get("image"); value.is_some() && ! (*value)->is_null())
         return SceneObjectKind::Image;
+    if (auto value = obj.get("shape"); value.is_some() && ! (*value)->is_null())
+        return SceneObjectKind::Shape;
     if (auto value = obj.get("particle"); value.is_some() && ! (*value)->is_null())
         return SceneObjectKind::Particle;
     if (auto value = obj.get("sound"); value.is_some() && ! (*value)->is_null())
@@ -204,10 +206,11 @@ SceneObjectMetadata parse_object_metadata(const sr::Json& obj, std::size_t raw_i
     metadata.kind      = object_kind(obj);
     if (! obj.is_object()) return metadata;
 
-    sr::GetJsonValue(obj, "id", metadata.id, false);
+    metadata.has_id = sr::GetJsonValue(obj, "id", metadata.id, false);
     sr::GetJsonValue(obj, "name", metadata.name, false);
-    sr::GetJsonValue(obj, "visible", metadata.visible, false);
+    ReadVisibleProperty(obj, metadata.visible, metadata.visible_user);
     sr::GetJsonValue(obj, "parent", metadata.parent, false);
+    sr::GetJsonValue(obj, "solid", metadata.solid, false);
 
     std::array<float, 2> size {};
     if (sr::GetJsonValue(obj, "size", size, false) && size[0] > 0.0f && size[1] > 0.0f) {
@@ -216,16 +219,42 @@ SceneObjectMetadata parse_object_metadata(const sr::Json& obj, std::size_t raw_i
     return metadata;
 }
 
-std::vector<SceneObjectMetadata> parse_objects_metadata(const sr::Json& root) {
-    std::vector<SceneObjectMetadata> objects;
-    auto                             raw_objects = root.get("objects");
+SceneObjectMetadata clone_object_metadata(const SceneObjectMetadata& source) {
+    SceneObjectMetadata clone;
+    clone.kind                       = source.kind;
+    clone.raw_index                  = source.raw_index;
+    clone.id                         = source.id;
+    clone.has_id                     = source.has_id;
+    clone.name                       = source.name;
+    clone.visible                    = source.visible;
+    clone.visible_user.name          = source.visible_user.name;
+    clone.visible_user.has_condition = source.visible_user.has_condition;
+    if (source.visible_user.has_condition)
+        clone.visible_user.condition = source.visible_user.condition.clone();
+    clone.parent = source.parent;
+    clone.solid  = source.solid;
+    clone.size   = source.size;
+    return clone;
+}
+
+std::vector<SceneObjectRecord> parse_object_records(const sr::Json& root,
+                                                    bool&           objects_are_array) {
+    std::vector<SceneObjectRecord> objects;
+    auto                           raw_objects = root.get("objects");
     if (raw_objects.is_none()) return objects;
 
     auto array = (*raw_objects)->as_array();
-    if (array.is_none()) return objects;
+    if (array.is_none()) {
+        objects_are_array = false;
+        return objects;
+    }
     objects.reserve((*array)->len());
     for (std::size_t i = 0; i < (*array)->len(); ++i) {
-        objects.push_back(parse_object_metadata((**array)[i], i));
+        const auto& authored = (**array)[i];
+        objects.push_back(SceneObjectRecord {
+            .metadata = parse_object_metadata(authored, i),
+            .authored = authored.clone(),
+        });
     }
     return objects;
 }
@@ -237,11 +266,11 @@ std::optional<std::array<uint32_t, 2>> image_extent(const SceneObjectMetadata& o
 }
 
 std::optional<std::array<uint32_t, 2>>
-largest_image_extent(std::span<const SceneObjectMetadata> objects) {
+largest_image_extent(std::span<const SceneObjectRecord> objects) {
     std::optional<std::array<uint32_t, 2>> best;
     uint64_t                               best_area = 0;
-    for (const auto& obj : objects) {
-        auto extent = image_extent(obj);
+    for (const auto& record : objects) {
+        auto extent = image_extent(record.metadata);
         if (! extent) continue;
         const uint64_t area =
             static_cast<uint64_t>((*extent)[0]) * static_cast<uint64_t>((*extent)[1]);
@@ -254,8 +283,7 @@ largest_image_extent(std::span<const SceneObjectMetadata> objects) {
 }
 
 std::optional<std::array<uint32_t, 2>>
-scene_canvas_extent(const SceneMetadata&                 metadata,
-                    std::span<const SceneObjectMetadata> objects_metadata) {
+scene_canvas_extent(const SceneMetadata& metadata, std::span<const SceneObjectRecord> objects) {
     const auto& general = metadata.general;
     if (! general.isOrtho) return std::nullopt;
 
@@ -265,7 +293,7 @@ scene_canvas_extent(const SceneMetadata&                 metadata,
         return std::array<uint32_t, 2> { static_cast<uint32_t>(ortho.width),
                                          static_cast<uint32_t>(ortho.height) };
     }
-    return largest_image_extent(objects_metadata);
+    return largest_image_extent(objects);
 }
 
 } // namespace
@@ -311,16 +339,23 @@ namespace sr::wpscene
 
 std::optional<SceneDocument> ParseSceneDocumentJson(std::string_view buf,
                                                     SceneVersion     pkg_version) {
-    SceneDocument doc;
-    auto          parsed = sr::ParseJson(buf);
+    auto parsed = sr::ParseJson(buf);
     if (parsed.is_err()) {
         rstd_error("Can't parse scene json: {}", parsed.unwrap_err());
         return std::nullopt;
     }
-    doc.root_json = parsed.unwrap();
+    return ParseSceneDocumentValue(parsed.unwrap(), pkg_version);
+}
+
+std::optional<SceneDocument> ParseSceneDocumentValue(sr::Json root, SceneVersion pkg_version) {
+    SceneDocument doc;
+    doc.root_json = std::move(root);
     if (! doc.metadata.FromJson(doc.root_json, pkg_version)) return std::nullopt;
-    doc.objects_metadata       = parse_objects_metadata(doc.root_json);
-    doc.metadata.canvas_extent = scene_canvas_extent(doc.metadata, doc.objects_metadata);
+    doc.objects = parse_object_records(doc.root_json, doc.objects_are_array);
+    doc.objects_metadata.reserve(doc.objects.size());
+    for (const auto& record : doc.objects)
+        doc.objects_metadata.push_back(clone_object_metadata(record.metadata));
+    doc.metadata.canvas_extent = scene_canvas_extent(doc.metadata, doc.objects);
     return doc;
 }
 

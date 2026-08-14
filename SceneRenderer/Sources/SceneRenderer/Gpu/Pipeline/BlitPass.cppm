@@ -18,6 +18,10 @@ public:
         std::string                   dst;
         std::optional<TextureRequest> src_request;
         std::optional<TextureRequest> dst_request;
+        // A snapshot copy with an implicit destination must use the exact
+        // source allocation description.  Re-resolving it from the generated
+        // destination name can otherwise select a different dynamic target.
+        bool                          dst_matches_src { false };
 
         ImageParameters vk_src;
         ImageParameters vk_dst;

@@ -40,6 +40,8 @@ uint64_t scene_id_key(uint32_t index, uint32_t generation) {
 
 uint64_t scene_id_key(SceneDrawItemId id) { return scene_id_key(id.index, id.generation); }
 
+uint64_t scene_id_key(SceneNodeId id) { return scene_id_key(id.index, id.generation); }
+
 uint64_t scene_id_key(SceneMaterialId id) { return scene_id_key(id.index, id.generation); }
 
 uint64_t scene_id_key(SceneMeshId id) { return scene_id_key(id.index, id.generation); }
@@ -237,6 +239,14 @@ void collect_linked_ids_from_node(SceneNode* node, Scene& scene, Set<i32>& out) 
                     }
                 }
             }
+            if (const auto& effect = effect_layer->FinalResolveEffect()) {
+                for (auto& effect_node : effect->nodes) {
+                    if (effect_node.sceneNode->HasMaterial()) {
+                        collect_linked_ids_from_material(*effect_node.sceneNode->Mesh()->Material(),
+                                                         out);
+                    }
+                }
+            }
         }
     }
     for (auto& child : node->GetChildren())
@@ -256,7 +266,7 @@ void collect_linked_ids_from_scene(Scene& scene, Set<i32>& out) {
 
 SceneNode* find_layer_node(SceneNode* node, Scene& scene, i32 id) {
     if (node == nullptr) return nullptr;
-    if (node->ID() == id) return node;
+    if (auto wallpaper = node->WallpaperIdentity(); wallpaper && wallpaper->value == id) return node;
 
     if (! node->Camera().empty()) {
         auto it = scene.cameras.find(node->Camera());
@@ -264,6 +274,12 @@ SceneNode* find_layer_node(SceneNode* node, Scene& scene, i32 id) {
             auto& effect_layer = it->second->GetImgEffect();
             for (usize i = 0; i < effect_layer->EffectCount(); i++) {
                 auto& effect = effect_layer->GetEffect(i);
+                for (auto& effect_node : effect->nodes) {
+                    if (auto* found = find_layer_node(effect_node.sceneNode.as_ptr(), scene, id))
+                        return found;
+                }
+            }
+            if (const auto& effect = effect_layer->FinalResolveEffect()) {
                 for (auto& effect_node : effect->nodes) {
                     if (auto* found = find_layer_node(effect_node.sceneNode.as_ptr(), scene, id))
                         return found;
@@ -365,8 +381,10 @@ void SceneResourceIndex::Rebuild(Scene& scene, uint32_t generation) {
 
     auto register_node = [&](SceneNode& node) {
         if (auto it = m_node_ids.find(&node); it != m_node_ids.end()) return it->second;
-        SceneNodeId id { .index = index_from_size(m_nodes.size()), .generation = generation };
-        m_nodes.push_back(&node);
+        SceneNodeId id = scene.RegisterNode(node);
+        const auto  required = static_cast<std::size_t>(id.index) + 1;
+        if (m_nodes.size() < required) m_nodes.resize(required, nullptr);
+        m_nodes[id.index] = &node;
         m_node_ids.emplace(&node, id);
         register_draw_items(node, id);
         return id;
@@ -618,7 +636,9 @@ void RenderSceneSnapshot::Rebuild(Scene& scene, RenderSceneVersion version) {
             }
         }
 
-        auto source_layer = WallpaperLayerId { .value = node != nullptr ? node->ID() : -1 };
+        auto wallpaper = node != nullptr ? node->WallpaperIdentity()
+                                         : std::optional<WallpaperLayerId> {};
+        auto source_layer = wallpaper.value_or(WallpaperLayerId {});
         m_render_item_ids.emplace(scene_id_key(item.id), id);
         m_source_layer_items[source_layer.value].push_back(id);
         m_material_render_items[scene_id_key(item.material)].push_back(id);
@@ -914,7 +934,9 @@ Scene::Scene()
     : sceneGraph(rstd::sync::Arc<SceneNode>::make()),
       vfs(nullptr, &delete_vfs),
       paritileSys(std::make_unique<ParticleSystem>(*this)),
-      m_resource_generation(next_scene_resource_generation()) {}
+      m_resource_generation(next_scene_resource_generation()) {
+    RegisterNode(*sceneGraph);
+}
 Scene::~Scene() = default;
 
 std::optional<SceneCameraTransforms> Scene::ActiveCameraTransforms() const {
@@ -970,7 +992,58 @@ bool SceneMaterial::TickShaderValueAnimations(double runtime) {
     return changed;
 }
 
+SceneNodeId Scene::RegisterNode(SceneNode& node,
+                                std::optional<WallpaperLayerId> wallpaper) {
+    if (! node.m_identity.Valid() || node.m_identity.generation != m_resource_generation) {
+        node.m_identity = SceneNodeId {
+            .index      = m_next_node_index++,
+            .generation = m_resource_generation,
+        };
+    }
+
+    if (wallpaper) {
+        if (node.m_wallpaper_identity && node.m_wallpaper_identity->value != wallpaper->value) {
+            return node.m_identity;
+        }
+        if (auto existing = m_wallpaper_node_ids.find(wallpaper->value);
+            existing != m_wallpaper_node_ids.end() && existing->second != node.m_identity) {
+            return node.m_identity;
+        }
+        node.m_wallpaper_identity              = wallpaper;
+        node.m_id                              = wallpaper->value;
+        m_wallpaper_node_ids[wallpaper->value] = node.m_identity;
+    } else if (! node.m_wallpaper_identity) {
+        node.m_id = -1;
+    }
+
+    const auto key = scene_id_key(node.m_identity);
+    if (! node.m_wallpaper_identity && ! node.Visible())
+        m_hidden_scene_node_ids.insert(key);
+    else
+        m_hidden_scene_node_ids.erase(key);
+    return node.m_identity;
+}
+
 void Scene::RebuildResourceIndex() { m_resource_index.Rebuild(*this, m_resource_generation); }
+
+void Scene::AttachRuntimeNode(SceneNode& parent, rstd::sync::Arc<SceneNode> node) {
+    RegisterNode(*node);
+    parent.AppendChild(std::move(node));
+    RebuildResourceIndex();
+    m_render_graph_dirty = true;
+}
+
+std::optional<std::size_t> Scene::LayerIndex(const SceneNode& node) const {
+    auto* parent = node.Parent();
+    return parent != nullptr ? parent->ChildIndex(node) : std::nullopt;
+}
+
+bool Scene::SortLayer(SceneNode& node, std::size_t index) {
+    auto* parent = node.Parent();
+    if (parent == nullptr || ! parent->MoveChild(node, index)) return false;
+    m_render_graph_dirty = true;
+    return true;
+}
 
 bool Scene::EnsureTextureDescriptor(std::string_view key) {
     if (key.empty() || IsSpecTex(key)) return true;
@@ -1075,27 +1148,47 @@ void Scene::RebuildElidableLayerIds() {
 }
 
 void Scene::MarkLayerStaticElidable(WallpaperLayerId id) {
+    if (id.value < 0) return;
     static_elidable_layer_ids.insert(id.value);
     elidable_layer_ids.insert(id.value);
 }
 
 void Scene::MarkLayerVisibilityElidable(WallpaperLayerId id) {
+    if (id.value < 0) return;
     visibility_elidable_layer_ids.insert(id.value);
     elidable_layer_ids.insert(id.value);
 }
 
+bool Scene::ConsumeRenderGraphDirty() {
+    const bool dynamic_visibility_changed =
+        m_hidden_scene_node_ids != m_render_graph_hidden_scene_node_ids;
+    const bool dirty     = m_render_graph_dirty || dynamic_visibility_changed;
+    m_render_graph_dirty = false;
+    if (dynamic_visibility_changed)
+        m_render_graph_hidden_scene_node_ids = m_hidden_scene_node_ids;
+    return dirty;
+}
+
 bool Scene::SetNodeVisible(SceneNode& node, bool visible) {
-    const i32 id = node.ID();
+    const auto wallpaper = node.WallpaperIdentity();
+    const i32  id        = wallpaper ? wallpaper->value : -1;
     // Same-value calls still have to run when the elision set disagrees with
     // the node flag: parse-time SetVisible() bypasses this bookkeeping, so the
     // first user toggle would otherwise no-op and leave the layer emitting.
     if (node.Visible() == visible) {
-        if (id < 0) return false;
+        if (id < 0) {
+            RegisterNode(node);
+            return false;
+        }
         if ((visibility_elidable_layer_ids.count(id) != 0) == ! visible) return false;
     }
 
+    const bool changed = node.Visible() != visible;
     node.SetVisible(visible);
-    if (id < 0) return false;
+    if (id < 0) {
+        RegisterNode(node);
+        return changed;
+    }
 
     // Do not mutate visibility_elidable_layer_ids here. A script may set the
     // same layer false and true before the frame is drawn; only its final

@@ -255,6 +255,9 @@ bool ParticleSubSystem::SyncPlayback() {
 }
 
 void ParticleSubSystem::Tick(double frame_time, bool update_mesh) {
+    // Hidden conditional layers remain loaded for later reactivation, but
+    // their simulation clock and particle state must stay paused while hidden.
+    if (m_owner_node != nullptr && ! m_owner_node->Visible()) return;
     const bool reset = SyncPlayback();
     if (m_playback_state && ! m_playback_state->playing.load(std::memory_order_acquire)) {
         if (reset && update_mesh && m_mesh_has_geometry) {

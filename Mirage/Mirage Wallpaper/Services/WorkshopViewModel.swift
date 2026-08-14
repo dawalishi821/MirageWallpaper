@@ -109,12 +109,6 @@ class WorkshopViewModel: ObservableObject {
     @Published private(set) var discoverItems: [WorkshopDiscoverCategory: [WorkshopItem]] = [:]
     @Published var discoverTrendPeriod: WorkshopTrendPeriod = .week
     @Published var isDiscoverLoading: Bool = false
-    @Published var discoverShowOnly: FRShowOnly = .none {
-        didSet {
-            guard discoverShowOnly != oldValue else { return }
-            UserDefaults.standard.set(discoverShowOnly.rawValue, forKey: Self.discoverShowOnlyStorageKey)
-        }
-    }
 
     var bannerItems: [WorkshopItem] {
         Array((discoverItems[.trending] ?? []).prefix(5))
@@ -256,7 +250,6 @@ class WorkshopViewModel: ObservableObject {
 
     private static let ageRatingStorageKey = "WorkshopAgeRatingFilter"
     private static let workshopShowOnlyStorageKey = "WorkshopShowOnlyV2"
-    private static let discoverShowOnlyStorageKey = "DiscoverShowOnlyV2"
     private static let subscriptionShowOnlyStorageKey = "SubscriptionShowOnlyV2"
 
     private var searchDebounce: AnyCancellable?
@@ -283,7 +276,6 @@ class WorkshopViewModel: ObservableObject {
 
     init() {
         workshopShowOnly = Self.storedShowOnly(forKey: Self.workshopShowOnlyStorageKey)
-        discoverShowOnly = Self.storedShowOnly(forKey: Self.discoverShowOnlyStorageKey)
         subscriptionShowOnly = Self.storedShowOnly(forKey: Self.subscriptionShowOnlyStorageKey)
         if let stored = UserDefaults.standard.object(forKey: Self.ageRatingStorageKey) as? Int {
             ageRatingFilter = WorkshopAgeRatingFilter(rawValue: stored)
@@ -347,9 +339,6 @@ class WorkshopViewModel: ObservableObject {
                 if self.workshopShowOnly.contains(.myFavourites) {
                     self.currentPage = 1
                     self.search()
-                }
-                if self.discoverShowOnly.contains(.myFavourites) {
-                    self.loadDiscover(force: true)
                 }
                 if self.subscriptionShowOnly.contains(.myFavourites) {
                     self.refreshSubscriptionFilters()
@@ -911,15 +900,7 @@ class WorkshopViewModel: ObservableObject {
         discoverTask?.cancel()
         discoverGeneration += 1
         let generation = discoverGeneration
-        let rating = ageRatingFilter
         let period = discoverTrendPeriod
-        let showOnly = discoverShowOnly
-        let favoriteIDs = SteamServiceManager.shared.workshopFavoriteIDs
-        if showOnly.contains(.myFavourites), !SteamServiceManager.shared.isLoggedIn {
-            discoverItems = [:]
-            isDiscoverLoading = false
-            return
-        }
         isDiscoverLoading = true
 
         discoverTask = Task { @MainActor [weak self] in
@@ -934,10 +915,7 @@ class WorkshopViewModel: ObservableObject {
                         let items = try? await SteamWebAPI.shared.fetchDiscover(
                             category: category,
                             period: period,
-                            count: category == .trending ? 15 : 12,
-                            ageRating: rating,
-                            showOnly: showOnly,
-                            favoriteIDs: favoriteIDs
+                            count: category == .trending ? 15 : 12
                         )
                         guard let items else { return nil }
                         return (category, items)
@@ -984,23 +962,6 @@ class WorkshopViewModel: ObservableObject {
             SteamServiceManager.shared.refreshWorkshopFavorites()
         }
         search()
-    }
-
-    func setDiscoverShowOnly(_ option: FRShowOnly, isOn: Bool) {
-        if isOn {
-            discoverShowOnly.insert(option)
-        } else {
-            discoverShowOnly.remove(option)
-        }
-        if discoverShowOnly.contains(.myFavourites) {
-            SteamServiceManager.shared.refreshWorkshopFavorites()
-        }
-        loadDiscover(force: true)
-    }
-
-    func clearDiscoverFilters() {
-        discoverShowOnly = .none
-        loadDiscover(force: true)
     }
 
     private func rememberCreators(in items: [WorkshopItem]) {

@@ -131,11 +131,17 @@ public:
         std::vector<float> values;
     };
 
-    // mdla>=4 timed curve event. `values` is a per-frame ease/blend curve.
-    struct AnimV4Event {
-        float              time;
-        uint32_t           flags;
+    struct AnimV4Curve {
+        uint16_t           id { 0 };
         std::vector<float> values;
+    };
+
+    // mdla>=4 timed morph event. Curves correspond to MDMP entries at the
+    // same event time; the first curve has implicit id 0 in the binary format.
+    struct AnimV4Event {
+        float                    time;
+        uint16_t                 flags;
+        std::vector<AnimV4Curve> curves;
     };
 
     // Trailing event list — present on every animation regardless of mdla

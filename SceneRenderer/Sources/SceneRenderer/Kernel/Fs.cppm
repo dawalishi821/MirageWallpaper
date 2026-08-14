@@ -3,6 +3,7 @@ module;
 #include <rstd/macro.hpp>
 #include <cstdio>
 #include <cstring>
+#include <unistd.h>
 
 export module sr.fs;
 import sr.core;
@@ -199,6 +200,7 @@ public:
     virtual bool  SeekEnd(idx offset)                  = 0;
 
     virtual isize Size() const = 0;
+    virtual bool  Flush() { return true; }
 
 protected:
     virtual usize Write_impl(const void* buffer, usize sizeInByte) = 0;
@@ -212,10 +214,24 @@ private:
 class IBinaryStreamW : IBinaryStream {
 public:
     virtual ~IBinaryStreamW() = default;
+    virtual bool Flush() override { return IBinaryStream::Flush(); }
     usize Write(const void* buffer, usize sizeInByte) { return Write_impl(buffer, sizeInByte); }
-    i32   WriteInt32(i32 x) { return _WriteInt<i32>(x); }
-    i32   WriteUint32(u32 x) { return _WriteInt<u32>(x); }
+    bool WriteAll(const void* buffer, usize sizeInByte) {
+        const auto* bytes  = static_cast<const std::byte*>(buffer);
+        usize       offset = 0;
+        while (offset < sizeInByte) {
+            const usize remaining = sizeInByte - offset;
+            const usize written   = Write_impl(bytes + offset, remaining);
+            if (written == 0 || written > remaining) return false;
+            offset += written;
+        }
+        return true;
+    }
+    bool WriteInt32(i32 x) { return _WriteInt<i32>(x); }
+    bool WriteUint32(u32 x) { return _WriteInt<u32>(x); }
 };
+
+using BinaryStreamWriter = std::function<bool(IBinaryStreamW&)>;
 
 // -- Fs (abstract) ---------------------------------------------------------
 
@@ -224,6 +240,10 @@ public:
     virtual bool                            Contains(RstdPath path) const = 0;
     virtual std::shared_ptr<IBinaryStream>  Open(RstdPath path)           = 0;
     virtual std::shared_ptr<IBinaryStreamW> OpenW(RstdPath path)          = 0;
+    virtual bool Publish(RstdPath path, const BinaryStreamWriter& writer) {
+        auto stream = OpenW(path);
+        return stream && writer(*stream) && stream->Flush();
+    }
 
     bool Contains(const char* path) const { return Contains(ToPath(path)); }
     bool Contains(std::string_view path) const { return Contains(ToPath(path)); }
@@ -273,6 +293,7 @@ public:
         std::fseek(m_file, cur, SEEK_SET);
         return size;
     }
+    virtual bool Flush() override { return std::fflush(m_file) == 0; }
 
 private:
     std::string m_path;
@@ -568,6 +589,25 @@ public:
         rstd_error("not found \"{}\" in vfs", path);
         return nullptr;
     }
+    bool Publish(std::string_view path, const BinaryStreamWriter& writer) {
+        return Publish(ToPath(path), writer);
+    }
+    bool Publish(const char* path, const BinaryStreamWriter& writer) {
+        return Publish(ToPath(path), writer);
+    }
+    bool Publish(RstdPath path, const BinaryStreamWriter& writer) {
+        for (auto iter = m_mountedFss.rbegin(); iter < m_mountedFss.rend(); iter++) {
+            auto mounted_path = iter->PathInMount(path);
+            if (mounted_path.is_none() || ! iter->fs->Contains(*mounted_path)) continue;
+            return iter->fs->Publish(*mounted_path, writer);
+        }
+        for (auto iter = m_mountedFss.rbegin(); iter < m_mountedFss.rend(); iter++) {
+            auto mounted_path = iter->PathInMount(path);
+            if (mounted_path.is_some()) return iter->fs->Publish(*mounted_path, writer);
+        }
+        rstd_error("not found \"{}\" in vfs", path);
+        return false;
+    }
     bool Contains(std::string_view path) const { return Contains(ToPath(path)); }
     bool Contains(const char* path) const { return Contains(ToPath(path)); }
     bool Contains(RstdPath path) const {
@@ -615,6 +655,35 @@ public:
         std::filesystem::path full_path { *fullpath };
         std::filesystem::create_directories(full_path.parent_path());
         return CreateCBinaryStreamW(full_path.native());
+    }
+    bool Publish(RstdPath path, const BinaryStreamWriter& writer) override {
+        auto target = FullPath(path);
+        if (! target) return false;
+
+        std::filesystem::path target_path { *target };
+        std::error_code       ec;
+        std::filesystem::create_directories(target_path.parent_path(), ec);
+        if (ec) return false;
+
+        static std::atomic<std::uint64_t> publication_sequence { 0 };
+        const auto temporary_path = target_path.string() + "." + std::to_string(::getpid()) +
+                                    "." + std::to_string(++publication_sequence) + ".tmp";
+        auto stream = CreateCBinaryStreamW(temporary_path);
+        if (! stream) return false;
+        const bool written = writer(*stream) && stream->Flush();
+        stream.reset();
+        if (! written) {
+            std::filesystem::remove(temporary_path, ec);
+            return false;
+        }
+
+        std::filesystem::rename(temporary_path, target_path, ec);
+        if (ec) {
+            std::error_code ignored;
+            std::filesystem::remove(temporary_path, ignored);
+            return false;
+        }
+        return true;
     }
 
 private:

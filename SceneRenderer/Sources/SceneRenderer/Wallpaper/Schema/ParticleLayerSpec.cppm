@@ -91,9 +91,14 @@ class Particle {
 public:
     enum class FlagEnum
     {
-        wordspace             = 0, // 1
-        spritenoframeblending = 1, // 2
-        perspective           = 2, // 4
+        wordspace                 = 0, // 1
+        spritenoframeblending     = 1, // 2
+        perspective               = 2, // 4
+        disable_color_override    = 3, // 8
+        disable_count_override    = 4, // 16
+        disable_lifetime_override = 5, // 32
+        disable_size_override     = 6, // 64
+        disable_speed_override    = 7, // 128
     };
     using EFlags = BitFlags<FlagEnum>;
 

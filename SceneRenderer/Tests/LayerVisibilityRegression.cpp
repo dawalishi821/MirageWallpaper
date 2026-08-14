@@ -59,6 +59,8 @@ struct Fixture {
         child->SetVisibleUserBinding(Binding("pbrfonttype", "\"1\""));
         container->AppendChild(child.clone());
         scene.sceneGraph->AppendChild(container.clone());
+        scene.RegisterNode(*container, sr::WallpaperLayerId { .value = 1 });
+        scene.RegisterNode(*child, sr::WallpaperLayerId { .value = 2 });
     }
 };
 
@@ -180,6 +182,44 @@ void TestFinalOutputOverrideRestoresAuthoredTarget() {
           "visible graph restores the authored final target");
 }
 
+void TestDynamicSceneIdentityAndVisibilityDebounce() {
+    sr::Scene scene;
+    auto      authored = rstd::sync::Arc<sr::SceneNode>::make();
+    authored->ID() = 42;
+    scene.RegisterNode(*authored, sr::WallpaperLayerId { .value = 42 });
+    scene.sceneGraph->AppendChild(authored.clone());
+
+    auto dynamic = rstd::sync::Arc<sr::SceneNode>::make();
+    dynamic->SetVisible(false);
+    scene.AttachRuntimeNode(*scene.sceneGraph, dynamic.clone());
+    const auto authored_id = authored->Identity();
+    const auto dynamic_id  = dynamic->Identity();
+
+    Check(authored_id.Valid() && dynamic_id.Valid() && authored_id != dynamic_id,
+          "authored and dynamic nodes receive distinct internal identities");
+    Check(authored->WallpaperIdentity().has_value() && authored->ID() == 42,
+          "authored nodes retain their wallpaper identity");
+    Check(! dynamic->WallpaperIdentity().has_value() && dynamic->ID() == -1,
+          "dynamic nodes expose no synthetic wallpaper identity");
+    Check(scene.ConsumeRenderGraphDirty(),
+          "attaching an initially hidden dynamic node invalidates the render graph");
+
+    scene.RebuildResourceIndex();
+    Check(authored->Identity() == authored_id && dynamic->Identity() == dynamic_id,
+          "resource-index rebuild preserves internal scene identities");
+    Check(scene.ResourceIndex().nodeId(*authored) == authored_id &&
+              scene.ResourceIndex().nodeId(*dynamic) == dynamic_id,
+          "resource index resolves stable internal identities");
+
+    Check(scene.SetNodeVisible(*dynamic, true), "dynamic node can be shown");
+    Check(scene.SetNodeVisible(*dynamic, false), "dynamic node can be hidden in the same tick");
+    Check(! scene.ConsumeRenderGraphDirty(),
+          "transient dynamic visibility changes do not rebuild when final state is unchanged");
+    Check(scene.SetNodeVisible(*dynamic, true), "dynamic node final visibility can change");
+    Check(scene.ConsumeRenderGraphDirty(),
+          "a changed final dynamic visibility state rebuilds the render graph");
+}
+
 } // namespace
 
 int main() {
@@ -188,6 +228,7 @@ int main() {
     TestContainerSurvivesChildBinding();
     TestDependencyCaptureAlpha();
     TestFinalOutputOverrideRestoresAuthoredTarget();
+    TestDynamicSceneIdentityAndVisibilityDebounce();
     if (g_failures == 0) std::cout << "LayerVisibilityRegression: ok\n";
     return g_failures == 0 ? 0 : 1;
 }

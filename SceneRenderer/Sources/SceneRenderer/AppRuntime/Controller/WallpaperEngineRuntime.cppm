@@ -1,4 +1,5 @@
 module;
+#include <cmath>
 #include <vulkan/vulkan.h>
 
 export module sr.scene_wallpaper;
@@ -27,6 +28,10 @@ using RenderPassDiagnosticCallback =
 // rendered frame is always opaque.
 using ClearColorCallback = std::function<void(float r, float g, float b)>;
 using AudioDemandCallback = std::function<void(bool needed)>;
+
+inline bool IsValidScenePlaybackSpeed(float speed) noexcept {
+    return std::isfinite(speed) && speed > 0.0f;
+}
 
 struct MediaStatus {
     uint32_t    state { 0 };

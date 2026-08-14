@@ -331,18 +331,12 @@ final class SteamWebAPI {
     func fetchDiscover(
         category: WorkshopDiscoverCategory,
         period: WorkshopTrendPeriod,
-        count: Int = 12,
-        ageRating: WorkshopAgeRatingFilter = .all,
-        showOnly: FRShowOnly = .none,
-        favoriteIDs: Set<String> = []
+        count: Int = 12
     ) async throws -> [WorkshopItem] {
         let sortOrder = category.sortOrder ?? .trending
         let result = try await queryFiles(
             tags: category.tag.map { [$0] } ?? [],
             sortOrder: sortOrder,
-            ageRating: ageRating,
-            showOnly: showOnly,
-            favoriteIDs: favoriteIDs,
             page: 1,
             perPage: count,
             trendDays: category.usesTrendPeriod ? period.rawValue : nil,

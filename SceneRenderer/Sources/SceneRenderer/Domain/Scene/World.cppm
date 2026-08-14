@@ -1162,6 +1162,18 @@ public:
 // SceneNode.h
 // ============================================================================
 
+struct SceneNodeId {
+    uint32_t index { std::numeric_limits<uint32_t>::max() };
+    uint32_t generation { 0 };
+
+    bool Valid() const { return index != std::numeric_limits<uint32_t>::max() && generation != 0; }
+    friend bool operator==(const SceneNodeId&, const SceneNodeId&) = default;
+};
+
+struct WallpaperLayerId {
+    i32 value { -1 };
+};
+
 // Lifetime invariant — tree topology is frozen post-parse.
 //
 // `m_children` / `m_parent` are written only during parse-time construction
@@ -1512,14 +1524,24 @@ public:
     // BFS over self + descendants; returns first node whose Name() matches.
     SceneNode* FindByName(std::string_view name);
 
+    std::optional<std::size_t> ChildIndex(const SceneNode& child) const;
+    bool                       MoveChild(SceneNode& child, std::size_t index);
+
+    SceneNodeId                     Identity() const { return m_identity; }
+    std::optional<WallpaperLayerId> WallpaperIdentity() const { return m_wallpaper_identity; }
+
     i32  ID() const { return m_id; }
     i32& ID() { return m_id; }
 
 private:
+    friend class Scene;
+
     void MarkTransDirty();
     void RegisterFieldAnimation(const std::shared_ptr<SceneAnimationPlayback>& playback);
 
-    i32         m_id { -1 };
+    SceneNodeId                     m_identity;
+    std::optional<WallpaperLayerId> m_wallpaper_identity;
+    i32                             m_id { -1 };
     std::string m_name;
 
     bool            m_dirty;
@@ -1691,6 +1713,7 @@ public:
         m_final_resolve_effect = std::move(effect);
         m_resolved             = false;
     }
+    const auto& FinalResolveEffect() const { return m_final_resolve_effect; }
     const auto& ResolvedEffects() const { return m_resolved_effects; }
     void        SetFinalLocal(bool value) {
         m_final_local = value;
@@ -2205,6 +2228,10 @@ private:
     bool                       m_positions_in_world_space { false };
 };
 
+// Effective instanceoverride state shared by a particle layer and its child
+// particle tree.  The authored state is shared so runtime user-property
+// changes reach every descendant, while each particle's flags decide which
+// fields are actually applied.
 class ParticleSubSystem : NoCopy, NoMove {
 public:
     enum class SpawnType
@@ -2438,13 +2465,9 @@ class IImageParser {
 public:
     IImageParser()                                                 = default;
     virtual ~IImageParser()                                        = default;
+    virtual bool                   Contains(const std::string&) const = 0;
     virtual std::shared_ptr<Image> Parse(const std::string&)       = 0;
     virtual ImageHeader            ParseHeader(const std::string&) = 0;
-};
-
-struct SceneNodeId {
-    uint32_t index { std::numeric_limits<uint32_t>::max() };
-    uint32_t generation { 0 };
 };
 
 struct SceneMaterialId {
@@ -2475,10 +2498,6 @@ struct SceneRenderTargetId {
 struct SceneCameraId {
     uint32_t index { std::numeric_limits<uint32_t>::max() };
     uint32_t generation { 0 };
-};
-
-struct WallpaperLayerId {
-    i32 value { -1 };
 };
 
 struct SceneLayerId {
@@ -2751,17 +2770,17 @@ public:
 
     std::vector<std::unique_ptr<SceneLight>> lights;
 
-    // user-property key → list of (material pointer, GLSL uniform name) pairs
+    // user-property key → list of (owned material, GLSL uniform name) pairs
     // pulled out of every material's shader-side `u_*` annotations during
     // parse. Reads sit at `WPUniformVar::material` (UI key) / `name` (GLSL
     // identifier). Lets a future RenderSetUserProperty handler push the new
     // value into the affected materials' `customShader.constValues` without
     // a per-frame walk over the scene tree.
-    Map<std::string, std::vector<std::pair<class SceneMaterial*, std::string>>>
+    Map<std::string, std::vector<std::pair<std::shared_ptr<class SceneMaterial>, std::string>>>
         shader_user_var_index;
 
     struct ShaderComboUserBinding {
-        SceneMaterial*                material { nullptr };
+        std::shared_ptr<SceneMaterial> material;
         std::string                   combo;
         std::string                   fallback;
         Map<std::string, std::string> options;
@@ -2785,8 +2804,8 @@ public:
     Map<std::string, std::vector<std::shared_ptr<SceneSoundControl>>> sound_volume_user_index;
 
     struct ImagePropertyBinding {
-        SceneNode*                  node { nullptr };
-        std::vector<SceneMaterial*> materials;
+        rstd::sync::Arc<SceneNode>                  node;
+        std::vector<std::shared_ptr<SceneMaterial>> materials;
     };
     Map<std::string, std::vector<ImagePropertyBinding>> image_color_user_index;
     Map<std::string, std::vector<ImagePropertyBinding>> image_alpha_user_index;
@@ -2824,9 +2843,9 @@ public:
     }
 
     struct MaterialTextureUserBinding {
-        SceneMaterial* material { nullptr };
-        uint32_t       slot { 0 };
-        std::string    fallback;
+        std::shared_ptr<SceneMaterial> material;
+        uint32_t                       slot { 0 };
+        std::string                    fallback;
     };
     Map<std::string, std::vector<MaterialTextureUserBinding>> material_texture_user_index;
 
@@ -2845,11 +2864,7 @@ public:
     bool        ImageEffectRuntimeVisible(const SceneImageEffectRef& ref) const;
     SceneMaterial* ImageEffectMaterial(const SceneImageEffectRef& ref, std::size_t index);
     bool SetImageEffectRuntimeVisible(const SceneImageEffectRef& ref, bool visible);
-    bool ConsumeRenderGraphDirty() {
-        bool dirty           = m_render_graph_dirty;
-        m_render_graph_dirty = false;
-        return dirty;
-    }
+    bool ConsumeRenderGraphDirty();
     void MarkDynamicTopologyDirty() { m_dynamic_topology_dirty = true; }
     bool CommitDynamicTopology();
     // Script frequently assigns a layer's visibility more than once in a
@@ -2989,6 +3004,13 @@ public:
     }
 
     void                      RebuildResourceIndex();
+    SceneNodeId               RegisterNode(
+                      SceneNode& node,
+                      std::optional<WallpaperLayerId> wallpaper = std::nullopt);
+    void                      AttachRuntimeNode(SceneNode& parent,
+                                                rstd::sync::Arc<SceneNode> node);
+    std::optional<std::size_t> LayerIndex(const SceneNode& node) const;
+    bool                       SortLayer(SceneNode& node, std::size_t index);
     SceneResourceIndex&       ResourceIndex() { return m_resource_index; }
     const SceneResourceIndex& ResourceIndex() const { return m_resource_index; }
     uint32_t                  ResourceGeneration() const { return m_resource_generation; }
@@ -2999,6 +3021,8 @@ private:
     void RebuildElidableLayerIds();
 
     uint32_t                                 m_resource_generation { 0 };
+    uint32_t                                 m_next_node_index { 0 };
+    std::unordered_map<i32, SceneNodeId>     m_wallpaper_node_ids;
     SceneResourceIndex                       m_resource_index;
     bool                                     m_render_graph_dirty { false };
     bool                                     m_dynamic_topology_dirty { false };
@@ -3011,6 +3035,8 @@ private:
     double                                   m_root_camera_default_height { 1.0 };
     bool                                     m_root_camera_viewport_captured { false };
     Map<i32, SceneNode*>                     m_pending_node_visibility_changes;
+    Set<uint64_t>                            m_hidden_scene_node_ids;
+    Set<uint64_t>                            m_render_graph_hidden_scene_node_ids;
     Map<i32, std::string>                    m_render_group_cameras;
     Map<std::string, std::shared_ptr<VideoPlaybackState>> m_video_controls;
     std::vector<SceneUserPropertyDiagnostic> m_user_property_diagnostics;

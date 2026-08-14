@@ -129,6 +129,11 @@ struct PropDescriptor {
 
 class FieldScript;
 
+struct LayerAssetReference {
+    std::string_view               path;
+    std::optional<std::string_view> workshop_id;
+};
+
 // One JsRuntime per Scene. Owns one JSRuntime and one JSContext. Compiled
 // modules are deduped by sha so duplicated sources across many bound fields
 // only allocate once. The runtime is not thread-safe; the renderer's frame
@@ -219,7 +224,7 @@ public:
                                       std::function<void(std::string_view)> setter);
 
     using LayerFactory = std::function<std::optional<rstd::sync::Arc<sr::SceneNode>>(
-        sr::SceneNode*, std::string_view)>;
+        sr::SceneNode*, LayerAssetReference)>;
     using LayerConfigFactory = std::function<std::optional<rstd::sync::Arc<sr::SceneNode>>(
         sr::SceneNode*, Json)>;
     void SetLayerFactory(LayerFactory factory);
@@ -243,6 +248,7 @@ public:
     bool               alive() const noexcept;
     std::string_view   script_sha() const noexcept;
     std::span<const std::string> RegisteredAssets() const noexcept;
+    std::optional<std::string_view> WorkshopId() const noexcept;
     void               AddAssetCloneQueue(std::string asset, std::vector<sr::SceneNode*> nodes);
 
     // Impl is intentionally exposed inside the sr.script module so

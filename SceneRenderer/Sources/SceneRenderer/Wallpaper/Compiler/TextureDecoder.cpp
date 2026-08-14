@@ -311,6 +311,11 @@ std::shared_ptr<Image> ParseExternalImage(std::string_view key, const std::strin
 
 } // namespace
 
+bool TextureAssetDecoder::Contains(const std::string& name) const {
+    if (ResolveExternalImagePath(name).has_value()) return true;
+    return m_vfs != nullptr && m_vfs->Contains("/assets/materials/" + name + ".tex");
+}
+
 std::shared_ptr<Image> TextureAssetDecoder::Parse(const std::string& name) {
     // Media-art URLs (`file://...` / absolute paths) bypass the .tex
     // container and decode straight from the on-disk image file.

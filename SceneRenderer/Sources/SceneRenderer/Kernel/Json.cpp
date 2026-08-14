@@ -21,12 +21,14 @@ struct JsonArrayTarget {
 template<typename T>
 struct JsonArrayTarget<std::vector<T>> {
     static constexpr bool enabled = true;
+    static constexpr bool dynamic = true;
     using value_type              = T;
 };
 
 template<typename T, std::size_t N>
 struct JsonArrayTarget<std::array<T, N>> {
     static constexpr bool enabled = true;
+    static constexpr bool dynamic = false;
     using value_type              = T;
 };
 
@@ -112,7 +114,32 @@ auto ReadJsonValue(const Json& json, T& value) -> bool {
     if constexpr (JsonArrayTarget<T>::enabled) {
         using Value = typename JsonArrayTarget<T>::value_type;
         if (input.is_number()) {
-            value = { ConvertNumber<Value>(input) };
+            if constexpr (JsonArrayTarget<T>::dynamic) {
+                value.clear();
+                value.push_back(ConvertNumber<Value>(input));
+            } else {
+                bool first = true;
+                for (auto& item : value) {
+                    item  = first ? ConvertNumber<Value>(input) : Value {};
+                    first = false;
+                }
+            }
+            return true;
+        }
+        if (auto array = input.as_array(); array.is_some()) {
+            if constexpr (JsonArrayTarget<T>::dynamic) {
+                value.clear();
+                value.reserve((*array)->len());
+                for (const auto& item : **array) value.push_back(ConvertNumber<Value>(item));
+            } else {
+                std::size_t count = 0;
+                for (auto& item : value) {
+                    if (count >= (*array)->len()) throw WrongArraySize {};
+                    item = ConvertNumber<Value>((**array)[count]);
+                    ++count;
+                }
+                if (count != (*array)->len()) throw WrongArraySize {};
+            }
             return true;
         }
         auto string = input.as_str();
