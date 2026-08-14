@@ -6,7 +6,6 @@
 
 import SwiftUI
 import AppKit
-import UniformTypeIdentifiers
 
 struct ExplorerItemMenu: SubviewOfContentView {
     
@@ -17,7 +16,7 @@ struct ExplorerItemMenu: SubviewOfContentView {
     // published several times per second and would make AppKit tear down and
     // rebuild an already-open menu.
     let workshopViewModel: WorkshopViewModel
-    let mobileDevicesViewModel: MobileDevicesViewModel
+    @ObservedObject var mobileDevicesViewModel: MobileDevicesViewModel
     
     var hoveredWallpaper: WEWallpaper
     
@@ -208,7 +207,7 @@ struct ExplorerItemMenu: SubviewOfContentView {
                 Button {
                     sendToMobileDevice(device)
                 } label: {
-                    Label("发送至 \(device.name)", systemImage: "iphone")
+                    Label(L("发送至 %@", device.name), systemImage: "iphone")
                 }
                 .disabled(!canExportToMobile)
             }
@@ -234,39 +233,29 @@ struct ExplorerItemMenu: SubviewOfContentView {
     }
 
     private var canExportToMobile: Bool {
-        hoveredWallpaper.isValid && hoveredWallpaper.kind == .video
+        hoveredWallpaper.isValid && [.video, .scene].contains(hoveredWallpaper.kind)
     }
 
     private func sendToMobileDevice(_ device: MobileDevice) {
+        if hoveredWallpaper.kind == .scene {
+            viewModel.pendingSceneMobileExport = SceneMobileExportRequest(
+                wallpaper: hoveredWallpaper,
+                destination: .device(device)
+            )
+            return
+        }
         mobileDevicesViewModel.send(wallpaper: hoveredWallpaper, to: device) { _ in }
     }
 
     private func exportMPKG() {
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [UTType(filenameExtension: "mpkg") ?? .data]
-        panel.nameFieldStringValue = MobileMPKGExporter.suggestedFilename(for: hoveredWallpaper)
-        panel.prompt = "导出"
-        panel.begin { response in
-            guard response == .OK, let url = panel.url else { return }
-            DispatchQueue.global(qos: .userInitiated).async {
-                do {
-                    try MobileMPKGExporter.export(hoveredWallpaper, to: url)
-                    DispatchQueue.main.async {
-                        viewModel.screenSaverFeedback = ScreenSaverFeedback(
-                            title: "导出完成",
-                            message: "已导出“\(url.lastPathComponent)”。"
-                        )
-                    }
-                } catch {
-                    DispatchQueue.main.async {
-                        viewModel.screenSaverFeedback = ScreenSaverFeedback(
-                            title: "导出 .mpkg 失败",
-                            message: error.localizedDescription
-                        )
-                    }
-                }
-            }
+        if hoveredWallpaper.kind == .scene {
+            viewModel.pendingSceneMobileExport = SceneMobileExportRequest(
+                wallpaper: hoveredWallpaper,
+                destination: .file
+            )
+            return
         }
+        viewModel.presentMobileMPKGSavePanel(for: hoveredWallpaper)
     }
 
     private func displayTitle(_ info: DisplayInfo) -> String {
