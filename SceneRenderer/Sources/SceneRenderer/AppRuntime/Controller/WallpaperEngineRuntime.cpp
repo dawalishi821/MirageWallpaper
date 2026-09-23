@@ -436,6 +436,27 @@ void ApplySolidColorNeutralization(Scene&                                       
                                    const Scene::MaterialSolidColorNeutralization& neutralization,
                                    SceneMaterial& material, bool texture_bound);
 
+void ApplyTextureAspectFill(Scene& scene, const Scene::MaterialTextureUserBinding& binding,
+                            const std::string& texture) {
+    if (! binding.aspect_fill.has_value() || ! binding.aspect_fill->mesh) return;
+    auto uv = binding.aspect_fill->fallback_uv;
+    auto it = scene.textures.find(texture);
+    if (texture != binding.fallback && it != scene.textures.end()) {
+        uv = AspectFillTextureUvRect(
+            it->second, binding.aspect_fill->target_size, binding.aspect_fill->nopadding);
+    }
+    binding.aspect_fill->mesh->SetCardTextureCoordinates(uv);
+    if (it == scene.textures.end() || binding.slot >= WE_GLTEX_RESOLUTION_NAMES.size()) return;
+    const std::array<float, 4> resolution {
+        static_cast<float>(it->second.width),
+        static_cast<float>(it->second.height),
+        static_cast<float>(it->second.content_width),
+        static_cast<float>(it->second.content_height),
+    };
+    scene.SetMaterialShaderValue(
+        *binding.material, WE_GLTEX_RESOLUTION_NAMES[binding.slot], resolution);
+}
+
 std::vector<SceneMaterialId>
 ApplyUserPropertyToMaterialTextures(Scene& scene, const std::string& key, const Json& prop) {
     std::vector<SceneMaterialId> changed_materials;
@@ -455,6 +476,8 @@ ApplyUserPropertyToMaterialTextures(Scene& scene, const std::string& key, const 
         if (mutation.changed && mutation.material.has_value()) {
             PushUniqueMaterialId(changed_materials, *mutation.material);
         }
+        if (binding.slot < binding.material->textures.size())
+            ApplyTextureAspectFill(scene, binding, binding.material->textures[binding.slot]);
         if (binding.solid_color.has_value()) {
             ApplySolidColorNeutralization(
                 scene, *binding.solid_color, *binding.material, next != binding.fallback);
