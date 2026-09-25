@@ -152,10 +152,24 @@ class ContentViewModel: DropDelegate {
     
     var importAlertPresented = false
     var isStaging = false
+    var isWindowVisible = true
     
-    var wallpapers = [WEWallpaper]() {
+    struct LibrarySnapshot {
+        let items: [WEWallpaper]
+        let byID: [String: WEWallpaper]
+
+        init(_ items: [WEWallpaper]) {
+            self.items = items
+            byID = Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        }
+    }
+
+    var librarySnapshot = LibrarySnapshot([]) {
         didSet { scheduleRecomputePage() }
     }
+
+    var wallpapers: [WEWallpaper] { librarySnapshot.items }
+    var wallpapersByID: [String: WEWallpaper] { librarySnapshot.byID }
     
     /// The wallpaper the trust sheet is currently asking about, together with
     /// what to do once the user confirms. Carrying both here is what keeps the
@@ -287,7 +301,8 @@ class ContentViewModel: DropDelegate {
         refresh()
     }
 
-    init() {
+    init(observeLibrary: Bool = true) {
+        guard observeLibrary else { return }
         let showOnlyMigrationKey = "FRShowOnlyMigrationV2"
         if !UserDefaults.standard.bool(forKey: showOnlyMigrationKey) {
             if let legacyRaw = UserDefaults.standard.object(forKey: "FRShowOnly") as? Int {
@@ -687,8 +702,9 @@ class ContentViewModel: DropDelegate {
             if shouldPrewarmSizes {
                 loaded.forEach { _ = $0.wallpaperSize }
             }
+            let snapshot = LibrarySnapshot(loaded)
             DispatchQueue.main.async {
-                self.wallpapers = loaded
+                self.librarySnapshot = snapshot
                 self.refreshInFlight = false
                 if self.refreshAgain {
                     self.refreshAgain = false

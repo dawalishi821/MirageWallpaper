@@ -132,11 +132,22 @@ class WorkshopViewModel {
     var presetDependencyPrompt: PresetDependencyPrompt?
 
     private(set) var subscriptionRecords: [WorkshopSubscription] = []
-    private(set) var subscriptionCatalogItems: [WorkshopItem] = []
+    private(set) var subscriptionCatalogItems: [WorkshopItem] = [] {
+        didSet {
+            subscriptionCatalogRevision &+= 1
+            subscriptionFilterWorker.cancel()
+            cachedSubscriptionFilter = nil
+            if subscriptionCatalogItems.isEmpty {
+                filteredSubscriptionItems = []
+                isFilteringSubscriptions = false
+            }
+        }
+    }
     private(set) var subscriptionItems: [WorkshopItem] = []
     private(set) var subscriptionTotal = 0
     private(set) var subscriptionStartIndex = 0
     private(set) var isLoadingSubscriptions = false
+    private(set) var isFilteringSubscriptions = false
     private(set) var subscriptionsError: String?
     var subscriptionSearchText = "" {
         didSet {
@@ -188,6 +199,8 @@ class WorkshopViewModel {
     // MARK: - Steam service state
 
     var steamSetupState: SteamSetupState = .checking
+    private(set) var directDownloadMode = false
+    var canUseSteamCommunity: Bool { !directDownloadMode && SteamServiceManager.shared.isLoggedIn }
     var steamServiceStatus = SteamServiceStatus()
     var logoutResultMessage: String?
     var isLoggingOut = false
@@ -268,6 +281,7 @@ class WorkshopViewModel {
     private let subscriptionSearchChanges = CurrentValueSubject<String, Never>("")
     private var serviceStateCancellables = Set<AnyCancellable>()
     private var cancelledDownloadIDs: Set<String> = []
+    private var isSwitchingDownloadMode = false
     private var pendingPresetApplication: (presetID: String, dependencyID: String, selectionGeneration: Int)?
     private var pendingCreatorPresetApplication: (presetID: String, dependencyID: String)?
     private var backgroundAutoApplyIDs: Set<String> = []
@@ -291,7 +305,60 @@ class WorkshopViewModel {
         return [10, 25, 50].contains(value) ? value : 50
     }
 
-    init() {
+    struct SubscriptionFilter: Equatable {
+        var query: String
+        var showOnly: FRShowOnly
+        var favorites: Set<String>
+        var types: Set<WorkshopTypeFilter>
+        var ageRating: WorkshopAgeRatingFilter
+        var tags: Set<String>
+        var widescreen: FRWidescreenResolution
+        var ultraWidescreen: FRUltraWidescreenResolution
+        var dualscreen: FRDualscreenResolution
+        var triplescreen: FRTriplescreenResolution
+        var portrait: FRPortraitScreenResolution
+        var misc: FRMiscResolution
+
+        func matches(_ item: WorkshopItem) -> Bool {
+            guard showOnly.matches(workshopItem: item, favoriteIDs: favorites),
+                  types.matches(item) else { return false }
+            if !query.isEmpty {
+                let values = [item.title, item.itemDescription, item.creatorDisplayName,
+                              item.creatorSteamId, item.publishedFileId] + item.tags
+                guard values.contains(where: { $0.localizedCaseInsensitiveContains(query) }) else { return false }
+            }
+            if !ageRating.isEmpty, ageRating != .all,
+               !ageRating.contains(item.ageRating ?? .everyone) { return false }
+            if !tags.isEmpty,
+               !item.tags.contains(where: { tags.contains($0.lowercased()) }) { return false }
+            return FRResolutionFilter.matches(tags: item.tags, widescreen: widescreen,
+                ultraWidescreen: ultraWidescreen, dualscreen: dualscreen, triplescreen: triplescreen,
+                portrait: portrait, misc: misc)
+        }
+    }
+
+    private struct SubscriptionFilterInput {
+        let items: [WorkshopItem]
+        let filter: SubscriptionFilter
+    }
+
+    @ObservationIgnored private var subscriptionCatalogRevision: UInt64 = 0
+    @ObservationIgnored private var cachedSubscriptionRevision: UInt64 = 0
+    @ObservationIgnored private var cachedSubscriptionFilter: SubscriptionFilter?
+    @ObservationIgnored private var filteredSubscriptionItems: [WorkshopItem] = []
+    @ObservationIgnored private var subscriptionFilterScheduled = false
+    @ObservationIgnored private var requestedSubscriptionStart = 0
+    @ObservationIgnored private let subscriptionFilterWorker = LatestValueWorker<SubscriptionFilterInput, [WorkshopItem]>(
+        label: "cn.laobamac.Mirage.subscriptions.filter") { input in
+            input.items.filter(input.filter.matches)
+        }
+
+    init(subscriptionCatalog: [WorkshopItem]? = nil) {
+        if let subscriptionCatalog {
+            subscriptionCatalogItems = subscriptionCatalog
+            rebuildSubscriptionPage(startIndex: 0)
+            return
+        }
         workshopShowOnly = Self.storedShowOnly(forKey: Self.workshopShowOnlyStorageKey)
         subscriptionShowOnly = Self.storedShowOnly(forKey: Self.subscriptionShowOnlyStorageKey)
         if let stored = UserDefaults.standard.object(forKey: Self.ageRatingStorageKey) as? Int {
@@ -331,16 +398,51 @@ class WorkshopViewModel {
                 self?.refreshSubscriptionFilters()
             }
 
+        DirectWorkshopService.shared.$isEnabled
+            .receive(on: RunLoop.main)
+            .sink { [weak self] enabled in
+                guard let self, self.directDownloadMode != enabled else { return }
+                self.isSwitchingDownloadMode = true
+                self.directDownloadMode = enabled
+                let tasks = self.downloadQueue.filter {
+                    switch $0.state {
+                    case .queued, .resolving, .downloading, .validating: return true
+                    default: return false
+                    }
+                }
+                for task in tasks { self.cancelDownload(task.workshopItem) }
+                self.isSwitchingDownloadMode = false
+                self.commentGeneration += 1
+                self.subscriptionGeneration += 1
+                self.isLoadingSubscriptions = false
+                self.comments = []
+                self.commentsCanPost = false
+                self.commentsItemID = nil
+                self.subscriptionDownloadPlan = nil
+                if enabled {
+                    let wasFilteringFavorites = self.workshopShowOnly.contains(.myFavourites)
+                    self.workshopShowOnly.remove(.myFavourites)
+                    self.workshopFavoriteIDs = []
+                    if wasFilteringFavorites {
+                        self.currentPage = 1
+                        self.search()
+                    }
+                } else {
+                    self.workshopFavoriteIDs = SteamServiceManager.shared.workshopFavoriteIDs
+                    SteamServiceManager.shared.restoreSessionIfNeeded()
+                }
+                self.refreshSetupState()
+                if let item = self.selectedItem { self.prepareWorkshopInteractions(for: item) }
+            }
+            .store(in: &serviceStateCancellables)
+
         SteamServiceManager.shared.$isLoggedIn
             .receive(on: RunLoop.main)
             .sink { [weak self] isLoggedIn in
                 guard let self else { return }
                 self.refreshSetupState()
-                guard isLoggedIn else { return }
+                guard isLoggedIn, !self.directDownloadMode else { return }
                 self.processDownloadQueue()
-                if self.subscriptionCatalogItems.isEmpty && !self.isLoadingSubscriptions {
-                    self.refreshSubscriptions(startIndex: 0)
-                }
                 if let item = self.selectedItem {
                     self.refreshSubscriptionStates(for: [item])
                     self.loadComments(for: item, startIndex: 0)
@@ -352,7 +454,7 @@ class WorkshopViewModel {
             .receive(on: RunLoop.main)
             .sink { [weak self] favoriteIDs in
                 guard let self else { return }
-                self.workshopFavoriteIDs = favoriteIDs
+                self.workshopFavoriteIDs = self.directDownloadMode ? [] : favoriteIDs
                 if self.workshopShowOnly.contains(.myFavourites) {
                     self.currentPage = 1
                     self.search()
@@ -563,6 +665,11 @@ class WorkshopViewModel {
     }
 
     private func refreshSetupState() {
+        if DirectWorkshopService.shared.isReady {
+            steamSetupState = .ready
+            steamServiceStatus.workshopDownload = .available(L("免登录下载已开启"))
+            return
+        }
         let manager = SteamServiceManager.shared
         steamSetupState = Self.resolveSteamSetupState(
             isAvailable: manager.isAvailable,
@@ -595,6 +702,7 @@ class WorkshopViewModel {
     }
 
     private func openSteamSetupIfActionable() {
+        guard !directDownloadMode else { return }
         if steamSetupState == .needsLogin || steamSetupState == .serviceUnavailable {
             AppDelegate.shared.openSteamSetup()
         }
@@ -621,7 +729,7 @@ class WorkshopViewModel {
         let requestMiscResolution = miscResolution
         let requestTrendPeriod = trendPeriod
         let requestPage = currentPage
-        if requestShowOnly.contains(.myFavourites), !SteamServiceManager.shared.isLoggedIn {
+        if requestShowOnly.contains(.myFavourites), !canUseSteamCommunity {
             items = []
             totalItems = 0
             isLoading = false
@@ -1204,6 +1312,7 @@ class WorkshopViewModel {
     }
 
     func setWorkshopShowOnly(_ option: FRShowOnly, isOn: Bool) {
+        if isOn && option == .myFavourites && directDownloadMode { return }
         if isOn {
             workshopShowOnly.insert(option)
         } else {
@@ -1246,7 +1355,7 @@ class WorkshopViewModel {
     }
 
     func refreshSubscriptions(startIndex: Int? = nil) {
-        guard SteamServiceManager.shared.isLoggedIn else {
+        guard canUseSteamCommunity else {
             subscriptionRecords = []
             subscriptionCatalogItems = []
             subscriptionItems = []
@@ -1440,8 +1549,8 @@ class WorkshopViewModel {
     }
 
     func downloadAllSubscriptions() {
-        guard SteamServiceManager.shared.isLoggedIn, !isPreparingSubscriptionDownloads else {
-            if !SteamServiceManager.shared.isLoggedIn { openSteamSetupIfActionable() }
+        guard canUseSteamCommunity, !isPreparingSubscriptionDownloads else {
+            if !canUseSteamCommunity { openSteamSetupIfActionable() }
             return
         }
         isPreparingSubscriptionDownloads = true
@@ -1470,6 +1579,7 @@ class WorkshopViewModel {
                     loaded = try await self.loadSubscriptionItems(for: allRecords)
                     subscriptionCount = total == Int.max ? allRecords.count : total
                 }
+                guard self.canUseSteamCommunity else { return }
                 let activeIDs = Set(self.downloadQueue.compactMap { task -> String? in
                     switch task.state {
                     case .queued, .resolving, .downloading, .validating:
@@ -1497,6 +1607,7 @@ class WorkshopViewModel {
     }
 
     func confirmSubscriptionDownloads() {
+        guard canUseSteamCommunity else { subscriptionDownloadPlan = nil; return }
         guard let plan = subscriptionDownloadPlan else { return }
         subscriptionDownloadPlan = nil
         for item in plan.items {
@@ -1534,6 +1645,7 @@ class WorkshopViewModel {
     }
 
     func toggleWorkshopFavorite(workshopId: String) {
+        guard !directDownloadMode else { return }
         guard steamSetupState == .ready else {
             openSteamSetupIfActionable()
             return
@@ -1561,7 +1673,7 @@ class WorkshopViewModel {
     }
 
     func refreshSubscriptionStates(for items: [WorkshopItem]) {
-        guard SteamServiceManager.shared.isLoggedIn else { return }
+        guard canUseSteamCommunity else { return }
         let ids = Set(items.map(\.publishedFileId)).filter {
             !$0.isEmpty && !checkingSubscriptionIDs.contains($0) && !changingSubscriptionIDs.contains($0)
         }
@@ -1574,6 +1686,7 @@ class WorkshopViewModel {
         SteamServiceManager.shared.fetchSubscriptionStates(workshopIds: Array(ids)) { [weak self] result in
             guard let self else { return }
             self.checkingSubscriptionIDs.subtract(ids)
+            guard self.canUseSteamCommunity else { return }
             switch result {
             case .success(let states):
                 for id in ids {
@@ -1592,6 +1705,7 @@ class WorkshopViewModel {
     }
 
     func subscribe(_ item: WorkshopItem) {
+        guard !directDownloadMode else { return }
         guard steamSetupState == .ready else {
             openSteamSetupIfActionable()
             return
@@ -1621,6 +1735,7 @@ class WorkshopViewModel {
     }
 
     func unsubscribe(_ item: WorkshopItem) {
+        guard !directDownloadMode else { return }
         let id = item.publishedFileId
         guard steamSetupState == .ready, !changingSubscriptionIDs.contains(id) else {
             if steamSetupState != .ready { openSteamSetupIfActionable() }
@@ -1654,6 +1769,7 @@ class WorkshopViewModel {
     }
 
     func prepareWorkshopInteractions(for item: WorkshopItem) {
+        guard !directDownloadMode else { return }
         refreshSubscriptionStates(for: [item])
         if commentsItemID != item.publishedFileId {
             loadComments(for: item, startIndex: 0)
@@ -1663,7 +1779,7 @@ class WorkshopViewModel {
     func loadComments(for item: WorkshopItem, startIndex: Int = 0) {
         commentAuthorTask?.cancel()
         commentGeneration += 1
-        guard SteamServiceManager.shared.isLoggedIn else {
+        guard canUseSteamCommunity else {
             comments = []
             commentsTotal = 0
             commentsStartIndex = 0
@@ -1774,6 +1890,7 @@ class WorkshopViewModel {
     }
 
     func postComment(for item: WorkshopItem) {
+        guard canUseSteamCommunity else { return }
         let text = commentDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, commentsCanPost, !isPostingComment else { return }
         isPostingComment = true
@@ -1814,55 +1931,58 @@ class WorkshopViewModel {
     }
 
     private func rebuildSubscriptionPage(startIndex: Int) {
-        let filtered = subscriptionCatalogItems.filter(matchesSubscriptionFilters)
+        requestedSubscriptionStart = startIndex
+        let filter = currentSubscriptionFilter()
+        subscriptionFilterWorker.cancel()
+        if cachedSubscriptionFilter == filter, cachedSubscriptionRevision == subscriptionCatalogRevision {
+            isFilteringSubscriptions = false
+            publishSubscriptionPage()
+            return
+        }
+        isFilteringSubscriptions = true
+        guard !subscriptionFilterScheduled else { return }
+        subscriptionFilterScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.subscriptionFilterScheduled = false
+            let revision = self.subscriptionCatalogRevision
+            let filter = self.currentSubscriptionFilter()
+            if self.cachedSubscriptionFilter == filter, self.cachedSubscriptionRevision == revision {
+                self.isFilteringSubscriptions = false
+                self.publishSubscriptionPage()
+                return
+            }
+            self.subscriptionFilterWorker.submit(.init(items: self.subscriptionCatalogItems, filter: filter)) { [weak self] items in
+                guard let self, self.subscriptionCatalogRevision == revision,
+                      self.currentSubscriptionFilter() == filter else { return }
+                self.filteredSubscriptionItems = items
+                self.cachedSubscriptionFilter = filter
+                self.cachedSubscriptionRevision = revision
+                self.isFilteringSubscriptions = false
+                self.publishSubscriptionPage()
+            }
+        }
+    }
+
+    private func publishSubscriptionPage() {
+        let filtered = filteredSubscriptionItems
         let maximumStart = filtered.isEmpty ? 0 : (filtered.count - 1) / subscriptionPageSize * subscriptionPageSize
-        let clampedStart = min(max(0, startIndex), maximumStart)
+        let clampedStart = min(max(0, requestedSubscriptionStart), maximumStart)
         subscriptionTotal = filtered.count
         subscriptionStartIndex = clampedStart
         subscriptionItems = Array(filtered.dropFirst(clampedStart).prefix(subscriptionPageSize))
     }
 
-    private func matchesSubscriptionFilters(_ item: WorkshopItem) -> Bool {
-        if !subscriptionShowOnly.matches(
-            workshopItem: item,
-            favoriteIDs: SteamServiceManager.shared.workshopFavoriteIDs
-        ) {
-            return false
-        }
-
-        let query = subscriptionSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !query.isEmpty {
-            let searchableValues = [
-                item.title,
-                item.itemDescription,
-                item.creatorDisplayName,
-                item.creatorSteamId,
-                item.publishedFileId
-            ] + item.tags
-            guard searchableValues.contains(where: { $0.localizedCaseInsensitiveContains(query) }) else {
-                return false
-            }
-        }
-
-        guard subscriptionSelectedTypeFilters.matches(item) else { return false }
-
-        if !subscriptionAgeRatingFilter.isEmpty,
-           subscriptionAgeRatingFilter != .all,
-           !subscriptionAgeRatingFilter.contains(item.ageRating ?? .everyone) {
-            return false
-        }
-
+    private func currentSubscriptionFilter() -> SubscriptionFilter {
         let selectableTags = Set(WorkshopTag.allCases.map(\.rawValue))
-        if !subscriptionSelectedTags.isEmpty,
-           !selectableTags.isSubset(of: subscriptionSelectedTags) {
-            let itemTags = Set(item.tags.map { $0.lowercased() })
-            guard subscriptionSelectedTags.contains(where: { itemTags.contains($0.lowercased()) }) else {
-                return false
-            }
-        }
-
-        return FRResolutionFilter.matches(
-            tags: item.tags,
+        return SubscriptionFilter(
+            query: subscriptionSearchText.trimmingCharacters(in: .whitespacesAndNewlines),
+            showOnly: subscriptionShowOnly,
+            favorites: workshopFavoriteIDs,
+            types: subscriptionSelectedTypeFilters,
+            ageRating: subscriptionAgeRatingFilter,
+            tags: selectableTags.isSubset(of: subscriptionSelectedTags)
+                ? [] : Set(subscriptionSelectedTags.map { $0.lowercased() }),
             widescreen: subscriptionWidescreenResolution,
             ultraWidescreen: subscriptionUltraWidescreenResolution,
             dualscreen: subscriptionDualscreenResolution,
@@ -1953,15 +2073,22 @@ class WorkshopViewModel {
         selectedItem = item
         showCustomization = false
         if let wallpaper = cachedInstalledWallpapers[item.publishedFileId] {
+            showCustomization = true
             let model = AppDelegate.shared.wallpaperViewModel
             let key = model.selectedDisplayKey
             model.prepareWallpaper(wallpaper, for: key) { [weak self, weak model] fresh in
-                guard let self, let model, self.selectionGeneration == generation else { return }
+                guard let self, let model else { return }
+                guard self.selectionGeneration == generation else {
+                    model.cancelPendingPreview(wallpaperID: fresh.id, for: key)
+                    return
+                }
                 if fresh.needsPresetDependency {
                     self.requestPresetDependency(for: fresh)
                 } else if fresh.presentationIsValid {
                     model.requestPreparedWallpaper(fresh, to: key)
                     self.showCustomization = true
+                } else {
+                    self.showCustomization = false
                 }
             }
         }
@@ -1969,7 +2096,7 @@ class WorkshopViewModel {
     }
 
     private func processDownloadQueue() {
-        guard steamSetupState == .ready else { return }
+        guard steamSetupState == .ready, !isSwitchingDownloadMode else { return }
         let maxConcurrent = 3
         var currentActive = downloadQueue.filter {
             if case .downloading = $0.state { return true }
@@ -2028,7 +2155,7 @@ class WorkshopViewModel {
                     )
                 } else if case .failed = state {
                     self.steamServiceStatus.workshopDownload = .unavailable(L("最近一次下载失败"))
-                    if SteamServiceManager.shared.isLoggedIn {
+                    if self.steamSetupState == .ready {
                         self.processDownloadQueue()
                     }
                 } else if case .resolving = state {
@@ -2133,10 +2260,17 @@ class WorkshopViewModel {
         let key = model.selectedDisplayKey
         selectionGeneration += 1
         let generation = selectionGeneration
+        showCreatorProfile = false
+        selectedCreator = nil
+        showCustomization = true
+        selectedItem = nil
         model.prepareWallpaper(wallpaper, for: key) { [weak self, weak model] fresh in
             guard let self, let model else { return }
             if fresh.needsPresetDependency {
-                guard self.selectionGeneration == generation else { return }
+                guard self.selectionGeneration == generation else {
+                    model.cancelPendingPreview(wallpaperID: fresh.id, for: key)
+                    return
+                }
                 self.showCreatorProfile = false
                 self.selectedCreator = nil
                 self.requestPresetDependency(for: fresh)
@@ -2219,6 +2353,13 @@ class WorkshopViewModel {
     }
 
     func dismissPresetDependencyPrompt() {
+        if let prompt = presetDependencyPrompt {
+            let model = AppDelegate.shared.wallpaperViewModel
+            let wallpaper = model.previewWallpaper
+            if wallpaper.wallpaperDirectory.lastPathComponent == prompt.presetID {
+                model.cancelPendingPreview(wallpaperID: wallpaper.id)
+            }
+        }
         presetDependencyPrompt = nil
         pendingCreatorPresetApplication = nil
     }

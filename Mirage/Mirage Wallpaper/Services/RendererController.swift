@@ -503,6 +503,7 @@ struct RenderOptions: Equatable {
     var loadFromMemory: Bool = false
     var enableHDRVideo: Bool = false
     var userProperties: [String: WEProjectProperty] = [:]
+    var scriptStorage: [String: String]? = nil
     var powerState: MiragePowerState = .run
     var powerFps: Int?
     /// Identifies the UI assignment that owns these playback options. A newer
@@ -514,6 +515,27 @@ struct RenderOptions: Equatable {
 // Subprocess control: the renderer receives JSON-line commands via stdin.
 final class RendererController {
     var onPositionAvailabilityChanged: ((CGDirectDisplayID) -> Void)?
+    var onScriptStorageChanged: ((CGDirectDisplayID, String, UUID?, [String: String]) -> Void)?
+    private var storageRequests: [String: (RendererProcess, () -> Void)] = [:]
+
+    func refreshScriptStorage(wallpaperID: String? = nil) async {
+        await withCheckedContinuation { continuation in
+            queue.async { [self] in
+                let group = DispatchGroup()
+                for handle in running.values where handle.wallpaper.kind == .scene &&
+                    (wallpaperID == nil || handle.wallpaper.id == wallpaperID) {
+                    let token = UUID().uuidString
+                    group.enter()
+                    storageRequests[token] = (handle, { group.leave() })
+                    handle.send(["cmd": "exportScriptStorage", "token": token])
+                    queue.asyncAfter(deadline: .now() + 2) { [weak self] in
+                        self?.storageRequests.removeValue(forKey: token)?.1()
+                    }
+                }
+                group.notify(queue: .main) { continuation.resume() }
+            }
+        }
+    }
     private enum TransitionPhase: String {
         case preparing
         case waitingForVisibilityBlockers
@@ -577,6 +599,12 @@ final class RendererController {
     private var transitions: [CGDirectDisplayID: ReplacementTransition] = [:] { didSet { updateQuerySnapshotLocked() } }
     private var pendingRequests: [CGDirectDisplayID: RenderRequest] = [:] { didSet { updateQuerySnapshotLocked() } }
     private var retiring: [ObjectIdentifier: RendererProcess] = [:] { didSet { updateQuerySnapshotLocked() } }
+    private struct PreviewProcess {
+        let handle: RendererProcess
+        let completion: (Bool) -> Void
+        var attempts = 0
+    }
+    private var previewProcesses: [String: PreviewProcess] = [:] { didSet { updateQuerySnapshotLocked() } }
     /// Processes removed by an explicit stop whose desktop window has not yet
     /// been confirmed hidden. A replacement may prepare behind these handles,
     /// but it cannot activate until each blocker emits a hidden lifecycle event
@@ -601,6 +629,7 @@ final class RendererController {
     private let commandQueueKey = DispatchSpecificKey<Bool>()
     private var submissionVersions: [CGDirectDisplayID: UUID] = [:]
     private var pendingSubmissions: [CGDirectDisplayID: UUID] = [:]
+    private var previewRequests: [String: CGDirectDisplayID] = [:]
 
     private var isOnCommandQueue: Bool { DispatchQueue.getSpecific(key: commandQueueKey) == true }
 
@@ -638,6 +667,9 @@ final class RendererController {
             submissionVersions[key] = UUID()
             pendingSubmissions[key] = nil
         }
+        previewRequests = previewRequests.filter { _, target in
+            displayID.map { target != $0 } ?? retained.contains(target)
+        }
         queryLock.unlock()
     }
 
@@ -658,7 +690,7 @@ final class RendererController {
         snapshot.positions = running.mapValues(\.positionAvailability)
         let handles = Array(running.values) + Array(candidates.values) +
             transitions.values.compactMap(\.standby) + Array(visibilityBlockers.values) +
-            Array(awaitingVisibleExits.values) + Array(retiring.values)
+            Array(awaitingVisibleExits.values) + Array(retiring.values) + previewProcesses.values.map(\.handle)
         snapshot.processIDs = Set(handles.compactMap {
             $0.process.isRunning ? $0.process.processIdentifier : nil
         })
@@ -763,7 +795,172 @@ final class RendererController {
         }
     }
 
-    /// Must be called on `queue`.
+    @discardableResult
+    func snapshot(wallpaper: WEWallpaper, onDisplay displayID: CGDirectDisplayID,
+                  options: RenderOptions, path: String, completion: @escaping (Bool) -> Void) -> String {
+        let token = UUID().uuidString
+        queryLock.lock()
+        guard !shuttingDown, !suspended,
+              wallpaper.kind == .scene || wallpaper.kind == .video else {
+            queryLock.unlock()
+            DispatchQueue.main.async { completion(false) }
+            return token
+        }
+        previewRequests[token] = displayID
+        queryLock.unlock()
+        commandQueue.async { [self] in
+            guard isCurrentPreview(token), wallpaper.isValid, let binary = binaryURL(for: wallpaper.kind) else {
+                rejectPreview(token, completion: completion)
+                return
+            }
+            var options = options
+            options.userProperties = WallpaperViewModel.resolveProperties(options.userProperties, for: wallpaper)
+            options.muted = true
+            options.volume = 0
+            options.powerState = .run
+            let process = Process()
+            process.executableURL = binary
+            let input = Pipe()
+            let output = Pipe()
+            let errors = Pipe()
+            process.standardInput = input
+            process.standardOutput = output
+            process.standardError = errors
+            let handle = RendererProcess(process: process, stdinPipe: input, stdoutPipe: output,
+                stderrPipe: errors, wallpaper: wallpaper, displayID: displayID, generation: 0,
+                options: options, spectrumEnabled: false)
+            var arguments = ["--display-id", String(displayID), "--control-stdin", "--deferred-show", "--muted",
+                             "--fill", options.fillMode.rawValue,
+                             "--position-x", String(options.position.x), "--position-y", String(options.position.y),
+                             "--run-seconds", String(Int(Self.preparationTimeout) + 2)]
+            var environment = ProcessInfo.processInfo.environment
+            if options.loadFromMemory { arguments.append("--load-from-memory") }
+            if wallpaper.kind == .scene {
+                arguments += [sceneAssetsDir.path, wallpaper.resolvedEntryURL.path,
+                              "--fps", String(options.fps), "--no-spectrum"]
+                if !options.userProperties.isEmpty {
+                    guard let properties = writeUserPropertiesFile(options.userProperties, for: wallpaper) else {
+                        handle.cleanupAfterExit()
+                        rejectPreview(token, completion: completion)
+                        return
+                    }
+                    arguments += ["--user-properties", properties.path]
+                    handle.tempFiles.append(properties)
+                }
+                let runtimeFile = FileManager.default.temporaryDirectory.appending(path: "mirage_runtime_\(token).json")
+                do {
+                    let runtime: [String: Any] = ["speed": options.speed,
+                        "scriptStorage": options.scriptStorage ?? WallpaperRenderSnapshot.storedScriptStorage(for: wallpaper)]
+                    try JSONSerialization.data(withJSONObject: runtime, options: .sortedKeys).write(to: runtimeFile, options: .atomic)
+                    arguments += ["--runtime", runtimeFile.path]
+                    handle.tempFiles.append(runtimeFile)
+                } catch {
+                    handle.cleanupAfterExit()
+                    rejectPreview(token, completion: completion)
+                    return
+                }
+                if let icd = moltenVKICD {
+                    environment["VK_ICD_FILENAMES"] = icd.path
+                    environment["VK_DRIVER_FILES"] = icd.path
+                }
+                let frameworks = Bundle.main.bundleURL.appending(path: "Contents/Frameworks")
+                if FileManager.default.fileExists(atPath: frameworks.path) {
+                    environment["DYLD_FALLBACK_LIBRARY_PATH"] = environment["DYLD_FALLBACK_LIBRARY_PATH"]
+                        .map { "\(frameworks.path):\($0)" } ?? frameworks.path
+                }
+            } else {
+                arguments += [wallpaper.renderDirectory.path, "--volume", "0"]
+            }
+            process.arguments = arguments
+            process.environment = environment
+            process.terminationHandler = { [weak self] process in
+                process.terminationHandler = nil
+                handle.cleanupAfterExit()
+                self?.queue.async { [weak self] in
+                    self?.finishPreview(token, success: false)
+                    self?.retiring.removeValue(forKey: ObjectIdentifier(handle))
+                }
+            }
+            let launched = queue.sync {
+                guard isCurrentPreview(token) else { return false }
+                do { try process.run() } catch { return false }
+                previewProcesses[token] = PreviewProcess(handle: handle, completion: completion)
+                return true
+            }
+            guard launched else {
+                process.terminationHandler = nil
+                handle.cleanupAfterExit()
+                rejectPreview(token, completion: completion)
+                return
+            }
+            handle.startReadingOutput { [weak self] event in
+                self?.queue.async { [weak self] in
+                    guard let self, var preview = self.previewProcesses[token] else { return }
+                    switch event["event"] as? String {
+                    case "first-frame-presented", "prepared":
+                        guard preview.attempts == 0 else { return }
+                        preview.attempts = 1
+                        self.previewProcesses[token] = preview
+                        preview.handle.send(["cmd": "resume"])
+                        preview.handle.send(["cmd": "snapshot", "path": path, "token": token])
+                    case "snapshot-done" where event["token"] as? String == token:
+                        if (event["ok"] as? Bool) == true {
+                            self.finishPreview(token, success: self.isCurrentPreview(token))
+                        } else if preview.attempts < 3, self.isCurrentPreview(token) {
+                            preview.attempts += 1
+                            self.previewProcesses[token] = preview
+                            self.queue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                                guard let self, let preview = self.previewProcesses[token], self.isCurrentPreview(token) else { return }
+                                preview.handle.send(["cmd": "snapshot", "path": path, "token": token])
+                            }
+                        } else {
+                            self.finishPreview(token, success: false)
+                        }
+                    case "renderer-error", "video-error":
+                        self.finishPreview(token, success: false)
+                    default: break
+                    }
+                }
+            }
+            queue.asyncAfter(deadline: .now() + Self.preparationTimeout) { [weak self] in
+                self?.finishPreview(token, success: false)
+            }
+        }
+        return token
+    }
+
+    func cancelPreview(_ token: String) {
+        queryLock.lock()
+        previewRequests.removeValue(forKey: token)
+        queryLock.unlock()
+        queue.async { [weak self] in self?.finishPreview(token, success: false) }
+    }
+
+    private func isCurrentPreview(_ token: String) -> Bool {
+        queryLock.lock()
+        defer { queryLock.unlock() }
+        return !shuttingDown && !suspended && previewRequests[token] != nil
+    }
+
+    private func rejectPreview(_ token: String, completion: @escaping (Bool) -> Void) {
+        queryLock.lock()
+        previewRequests.removeValue(forKey: token)
+        queryLock.unlock()
+        DispatchQueue.main.async { completion(false) }
+    }
+
+    private func finishPreview(_ token: String, success: Bool) {
+        guard let preview = previewProcesses.removeValue(forKey: token) else { return }
+        queryLock.lock()
+        previewRequests.removeValue(forKey: token)
+        queryLock.unlock()
+        if preview.handle.process.isRunning {
+            retiring[ObjectIdentifier(preview.handle)] = preview.handle
+        }
+        preview.handle.stop(alreadyDeactivated: true)
+        DispatchQueue.main.async { preview.completion(success) }
+    }
+
     private func completeSnapshot(token: String, ok: Bool) {
         guard let pending = snapshotPending.removeValue(forKey: token) else { return }
         DispatchQueue.main.async { pending(ok) }
@@ -1352,6 +1549,23 @@ final class RendererController {
         if isVisibilityBlocker {
             if event == "deactivated" || event == "activation-failed" {
                 visibilityBlockerBecameHiddenLocked(handle)
+            }
+            return
+        }
+
+        if event == "script-storage" {
+            let token = message["token"] as? String
+            let request = token.flatMap { storageRequests[$0] }
+            guard request == nil || request?.0 === handle else { return }
+            let completion = token.flatMap { storageRequests.removeValue(forKey: $0)?.1 }
+            let wallpaperID = handle.wallpaper.id
+            let assignmentID = handle.assignmentID
+            let values = message["values"] as? [String: String]
+            DispatchQueue.main.async { [weak self] in
+                if isActive, let values, values.count <= 1024 {
+                    self?.onScriptStorageChanged?(displayID, wallpaperID, assignmentID, values)
+                }
+                completion?()
             }
             return
         }
@@ -2110,6 +2324,17 @@ final class RendererController {
         }
 
         var completions: [(Bool) -> Void] = []
+        let previewKeys = previewProcesses.compactMap { key, preview in
+            preview.handle.displayID == displayID ? key : nil
+        }
+        for key in previewKeys {
+            guard let preview = previewProcesses.removeValue(forKey: key) else { continue }
+            append(preview.handle)
+            completions.append(preview.completion)
+            if !detachProcessOwnership {
+                retiring[ObjectIdentifier(preview.handle)] = preview.handle
+            }
+        }
         if let candidate {
             completions.append(contentsOf: takeTransitionCompletionsLocked(from: candidate))
         } else if let transition {
@@ -2172,6 +2397,7 @@ final class RendererController {
         }
         let (handles, transitionCompletions): ([RendererProcess], [(Bool) -> Void]) = queue.sync {
             let owned = Set(running.keys)
+                .union(previewProcesses.values.map { $0.handle.displayID })
                 .union(candidates.keys)
                 .union(transitions.keys)
                 .union(pendingRequests.keys)
@@ -2202,6 +2428,7 @@ final class RendererController {
         }
         let (handles, transitionCompletions): ([RendererProcess], [(Bool) -> Void]) = queue.sync {
             let owned = Set(running.keys)
+                .union(previewProcesses.values.map { $0.handle.displayID })
                 .union(candidates.keys)
                 .union(transitions.keys)
                 .union(pendingRequests.keys)
@@ -2226,6 +2453,7 @@ final class RendererController {
     func suspendAllAndWait() {
         queryLock.lock()
         suspended = true
+        previewRequests.removeAll()
         submissionVersions.removeAll()
         pendingSubmissions.removeAll()
         queryLock.unlock()
@@ -2252,6 +2480,7 @@ final class RendererController {
     func stopAllAndWait() {
         queryLock.lock()
         shuttingDown = true
+        previewRequests.removeAll()
         submissionVersions.removeAll()
         pendingSubmissions.removeAll()
         queryLock.unlock()
@@ -2261,6 +2490,7 @@ final class RendererController {
     private func stopAllProcessesAndWait() {
         let (handles, transitionCompletions): ([RendererProcess], [(Bool) -> Void]) = queue.sync {
             let owned = Set(running.keys)
+                .union(previewProcesses.values.map { $0.handle.displayID })
                 .union(candidates.keys)
                 .union(transitions.keys)
                 .union(pendingRequests.keys)
@@ -2987,30 +3217,7 @@ final class RendererController {
 
     private func writeUserPropertiesFile(_ props: [String: WEProjectProperty], for wallpaper: WEWallpaper) -> URL? {
         guard !props.isEmpty else { return nil }
-        var obj: [String: Any] = [:]
-        for (key, prop) in props {
-            switch prop.propertyType {
-            case .color:
-                obj[key] = ["type": "color", "value": prop.value.stringValue]
-            case .bool:
-                obj[key] = prop.value.boolValue
-            case .slider:
-                obj[key] = prop.value.doubleValue
-            case .scenetexture, .file:
-                obj[key] = ["type": "scenetexture", "value": prop.value.stringValue]
-            case .combo:
-                obj[key] = prop.value.jsonObjectValue
-            case .usershortcut:
-                var value: [String: Any] = [
-                    "type": "usershortcut",
-                    "value": prop.value.stringValue
-                ]
-                if let icon = prop.mirageShortcutIcon { value["icon"] = icon }
-                obj[key] = value
-            default:
-                obj[key] = prop.value.stringValue
-            }
-        }
+        let obj = WallpaperPropertyEncoding.values(props)
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: []) else { return nil }
         let tmp = FileManager.default.temporaryDirectory
             .appending(path: "mirage_props_\(abs(wallpaper.id.hashValue))_\(UUID().uuidString).json")

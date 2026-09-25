@@ -31,8 +31,8 @@ struct WorkshopItemDetail: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .task(id: item?.publishedFileId) {
-            guard let item else { return }
+        .task(id: isActive ? item?.publishedFileId : nil) {
+            guard isActive, let item else { return }
             workshopViewModel.prepareWorkshopInteractions(for: item)
         }
         .confirmationDialog(
@@ -56,7 +56,8 @@ struct WorkshopItemDetail: View {
                 WorkshopImage(
                     url: item.previewImageURL,
                     contentMode: .fill,
-                    isAnimating: isActive
+                    isAnimating: isActive,
+                    isLoadingEnabled: isActive
                 )
                     .frame(width: 280, height: 280)
                     .clipShape(RoundedRectangle(cornerRadius: 12))
@@ -145,8 +146,13 @@ struct WorkshopItemDetail: View {
                 tagList(for: item)
 
                 sectionHeader("操作")
-                favoriteSection(for: item)
-                subscriptionSection(for: item)
+                if workshopViewModel.directDownloadMode {
+                    Text("免登录模式仅支持下载，请关闭此模式并登录 Steam 以使用社区功能")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    favoriteSection(for: item)
+                    subscriptionSection(for: item)
+                }
                 WorkshopItemDownloadStatus(
                     workshopID: item.publishedFileId,
                     downloadStore: workshopViewModel.downloadStore
@@ -176,8 +182,10 @@ struct WorkshopItemDetail: View {
                         .lineLimit(8)
                 }
 
-                sectionHeader("评论")
-                commentsSection(for: item)
+                if !workshopViewModel.directDownloadMode {
+                    sectionHeader("评论")
+                    commentsSection(for: item)
+                }
 
                 sectionHeader("信息")
                 VStack(alignment: .leading, spacing: 4) {
@@ -924,7 +932,9 @@ struct CreatorProfileView: View {
                         }
                         .contextMenu {
                             Section {
-                                if workshopViewModel.changingFavoriteIDs.contains(item.publishedFileId) {
+                                if workshopViewModel.directDownloadMode {
+                                    Label("免登录下载已开启", systemImage: "arrow.down.circle")
+                                } else if workshopViewModel.changingFavoriteIDs.contains(item.publishedFileId) {
                                     Label("正在同步收藏状态…", systemImage: "arrow.triangle.2.circlepath")
                                 } else {
                                     Button {

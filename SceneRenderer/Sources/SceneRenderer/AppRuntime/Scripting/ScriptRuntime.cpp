@@ -3,6 +3,7 @@ module;
 #include <rstd/macro.hpp>
 #include <rstd/enum.hpp>
 #include "quickjs.h"
+#include <filesystem>
 
 module sr.script;
 import eigen;
@@ -25,8 +26,7 @@ namespace
 {
 
 FieldKind GuessFieldKind(std::string_view field) {
-    // Visible/enabled-style fields: bool. Several scripts return numbers
-    // 0/1 here too; coercion table accepts both.
+    // Visible/enabled-style fields: bool.
     if (field == "visible") return FieldKind::Bool;
     // Vec3 (position-like) fields.
     if (field == "origin" || field == "scale" || field == "angles" || field == "spriteoffset")
@@ -139,8 +139,8 @@ ScriptValue CoerceReturn(JSContext* ctx, JSValue ret, FieldKind kind) {
 
     switch (kind) {
     case FieldKind::Bool: {
-        int b = JS_ToBool(ctx, ret);
-        return BoolValue { b > 0 };
+        if (! JS_IsBool(ret)) return {};
+        return BoolValue { JS_ToBool(ctx, ret) > 0 };
     }
     case FieldKind::Scalar: {
         if (JS_IsBool(ret)) {
@@ -496,6 +496,7 @@ struct EngineHostState {
     // Empty `ls_path` means in-memory only (the legacy bootstrap shape).
     std::unordered_map<std::string, std::string> ls_data;
     std::string                                  ls_path;
+    std::function<void(std::string)>              ls_callback;
     // SR-SEC-16: quota + write debounce. `ls_bytes` is the running key+value
     // byte total so the cap check stays O(1) per set(); `ls_dirty` defers the
     // full re-serialise + blocking write off the per-frame path (a script
@@ -706,6 +707,7 @@ struct FieldScript::Impl {
     ScriptValue last_value;
     bool        alive { true };
     bool        error_logged { false };
+    bool        bool_return_warned { false };
     // Layer-B: the SceneNode this script's `thisLayer` resolves to. Null →
     // fall back to the generic JS stub. `wrapped_layer` caches the JSValue
     // wrapper so per-frame swap doesn't reallocate.
@@ -715,6 +717,7 @@ struct FieldScript::Impl {
     // Per-script cursor-inside-bbox state used to edge-detect
     // cursorEnter / cursorLeave between frames.
     bool cursor_inside { false };
+    bool has_cursor_exports { false };
     // Buttons whose press landed on this node. While a button is captured the
     // node keeps receiving cursorMove / cursorUp even after the cursor leaves
     // its bbox, so a drag survives fast pointer motion and release-outside —
@@ -755,6 +758,21 @@ void FieldScript::AddAssetCloneQueue(std::string asset, std::vector<sr::SceneNod
         m_impl->clone_asset_keys[node] = asset;
         queue.push_back(node);
     }
+}
+
+namespace
+{
+
+void NoteBoolReturnMismatch(FieldKind kind, bool& warned, std::string_view sha, JSValueConst ret,
+                            const char* fn) {
+    if (kind != FieldKind::Bool || warned) return;
+    if (JS_IsUndefined(ret) || JS_IsNull(ret) || JS_IsBool(ret)) return;
+    warned = true;
+    rstd_warn("script[{}] {} returned a non-boolean for a bool property; the value was ignored",
+              sha,
+              std::string_view(fn));
+}
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,21 +1034,32 @@ constexpr std::size_t kLocalStorageMaxValue = 64ull * 1024;
 // seconds, short enough that a crash loses very little.
 constexpr std::chrono::milliseconds kLocalStorageFlushInterval { 2000 };
 
-void FlushLocalStorage(EngineHostState* host) {
-    host->ls_dirty      = false;
-    host->ls_last_flush = std::chrono::steady_clock::now();
-    if (host->ls_path.empty()) return;
+std::string StorageSnapshot(const EngineHostState* host) {
     auto object = rstd::json::Map::make();
     for (const auto& [k, v] : host->ls_data)
         object.insert(::alloc::string::String::make(rstd::cppstd::as_str(k)), JsonFromStd(v));
-    auto out = Json::Object(rstd::move(object));
-    // ofstream defaults to ios_base::out | trunc, which is what we want.
-    std::ofstream f(host->ls_path);
-    if (! f) {
-        rstd_warn("localStorage flush: cannot open {}", host->ls_path);
-        return;
+    return Dump(Json::Object(rstd::move(object)));
+}
+
+void FlushLocalStorage(EngineHostState* host) {
+    host->ls_dirty      = false;
+    host->ls_last_flush = std::chrono::steady_clock::now();
+    if (host->ls_path.empty() && !host->ls_callback) return;
+    const auto snapshot = StorageSnapshot(host);
+    if (host->ls_callback) host->ls_callback(snapshot);
+    if (host->ls_path.empty()) return;
+    const auto temporary = host->ls_path + "." +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "." +
+        std::to_string(reinterpret_cast<std::uintptr_t>(host)) + ".tmp";
+    std::ofstream file(temporary, std::ios::binary);
+    file << snapshot;
+    file.close();
+    std::error_code error;
+    if (file) std::filesystem::rename(temporary, host->ls_path, error);
+    if (!file || error) {
+        rstd_warn("localStorage flush failed: {}", host->ls_path);
+        std::filesystem::remove(temporary, error);
     }
-    f << Dump(out);
 }
 
 // Cheap enough to call once per frame: one bool plus one steady_clock read.
@@ -4419,6 +4448,45 @@ void JsRuntime::SetPersistence(std::string path) {
     LoadLocalStorage(&m_impl->host);
 }
 
+void JsRuntime::SetStorageSnapshot(std::string_view snapshot) {
+    auto* host = &m_impl->host;
+    host->ls_path.clear();
+    host->ls_data.clear();
+    host->ls_bytes = 0;
+    host->ls_dirty = false;
+    auto parsed = ParseJson(snapshot);
+    if (parsed.is_err()) return;
+    auto value = parsed.unwrap();
+    auto object = value.as_object();
+    if (object.is_none()) return;
+    (*object)->iter().for_each([&](auto entry) {
+        auto [key, value] = entry;
+        auto text = value->as_str();
+        if (text.is_none()) return;
+        auto k = rstd::cppstd::to_string(key->as_str());
+        auto v = rstd::cppstd::to_string(*text);
+        if (host->ls_data.size() >= kLocalStorageMaxKeys || v.size() > kLocalStorageMaxValue ||
+            host->ls_bytes + k.size() + v.size() > kLocalStorageMaxBytes) return;
+        host->ls_bytes += k.size() + v.size();
+        host->ls_data.emplace(std::move(k), std::move(v));
+    });
+}
+
+std::string JsRuntime::StorageSnapshot() const {
+    return sr::script::StorageSnapshot(&m_impl->host);
+}
+
+void JsRuntime::SetStorageCallback(std::function<void(std::string)> callback) {
+    m_impl->host.ls_callback = std::move(callback);
+    PublishStorageSnapshot();
+}
+
+void JsRuntime::PublishStorageSnapshot() {
+    auto* host = &m_impl->host;
+    if (host->ls_dirty) FlushLocalStorage(host);
+    else if (host->ls_callback) host->ls_callback(StorageSnapshot());
+}
+
 void JsRuntime::ResetLocalStorage() {
     m_impl->host.ls_data.clear();
     m_impl->host.ls_bytes = 0;
@@ -4540,7 +4608,7 @@ void JsRuntime::TickAll() {
     };
     for (auto& fs : m_impl->scripts) {
         auto* I = fs->m_impl.get();
-        if (! I->alive || ! I->node) continue;
+        if (! I->alive || ! I->node || ! I->has_cursor_exports) continue;
         const auto current_cursor = ResolveCursorNode(&m_impl->host, I->node, cursor);
         const bool over_node = in_window && ancestors_visible(I->node) && I->node->Solid() &&
                                current_cursor.inside;
@@ -4612,6 +4680,7 @@ void JsRuntime::TickAll() {
             JS_FreeValue(ctx, ret);
             continue;
         }
+        NoteBoolReturnMismatch(I->kind, I->bool_return_warned, I->sha, ret, "update");
         I->last_value = CoerceReturn(ctx, ret, I->kind);
         // Keep the next argument in the field's coerced shape. Vec3 scripts
         // often return a scalar for scale, but still read value.x next frame.
@@ -4727,7 +4796,18 @@ void RunFieldScriptInit(JSContext* ctx, JsRuntime::Impl* rt, FieldScript* fs) {
     JSValue arg                  = JS_DupValue(ctx, I->current_value);
     JSValue r                    = JS_Call(ctx, I->init_fn, JS_UNDEFINED, 1, &arg);
     JS_FreeValue(ctx, arg);
-    if (JS_IsException(r)) rt->LogError(ctx, I->sha, "init threw");
+    if (JS_IsException(r)) {
+        rt->LogError(ctx, I->sha, "init threw");
+    } else {
+        NoteBoolReturnMismatch(I->kind, I->bool_return_warned, I->sha, r, "init");
+        ScriptValue initial = CoerceReturn(ctx, r, I->kind);
+        if (! std::holds_alternative<std::monostate>(initial)) {
+            JSValue next = ScriptValueToJs(ctx, initial);
+            JS_FreeValue(ctx, I->current_value);
+            I->current_value = next;
+            I->last_value    = std::move(initial);
+        }
+    }
     JS_FreeValue(ctx, r);
     rt->host.active_field_script = nullptr;
     I->init_done                 = true;
@@ -4826,6 +4906,14 @@ FieldScript* JsRuntime::MakeFieldScript(
     I->sha           = sha_str;
     I->kind          = (field_kind_in == FieldKind::Unknown) ? FieldKind::Scalar : field_kind_in;
     I->module_ns     = ns; // owns one ref now
+    // Test export presence, not its initial value: an exported live binding
+    // may acquire a callback later. Modules cannot add new export names.
+    for (const char* name :
+         { "cursorEnter", "cursorLeave", "cursorMove", "cursorDown", "cursorUp", "cursorClick" }) {
+        const JSAtom atom = JS_NewAtom(ctx, name);
+        I->has_cursor_exports |= JS_HasProperty(ctx, ns, atom) > 0;
+        JS_FreeAtom(ctx, atom);
+    }
     I->node          = node;
     I->wrapped_layer = wrapped; // takes ownership; freed in JsRuntime dtor
     I->clone_queue   = std::move(clones);
@@ -5095,6 +5183,17 @@ void SetSceneUserShortcutOpener(sr::Scene& scene, UserShortcutOpener opener) {
     auto* ss = static_cast<ScriptScene*>(scene.script_scene.get());
     if (! ss) return;
     ss->runtime().SetUserShortcutOpener(std::move(opener));
+}
+
+std::string SceneStorageSnapshot(sr::Scene& scene) {
+    auto* ss = static_cast<ScriptScene*>(scene.script_scene.get());
+    return ss ? ss->runtime().StorageSnapshot() : "{}";
+}
+
+void SetSceneStorageCallback(sr::Scene& scene, std::function<void(std::string)> callback) {
+    auto* ss = static_cast<ScriptScene*>(scene.script_scene.get());
+    if (ss) ss->runtime().SetStorageCallback(std::move(callback));
+    else if (callback) callback("{}");
 }
 
 void ResetSceneLocalStorage(sr::Scene& scene) {

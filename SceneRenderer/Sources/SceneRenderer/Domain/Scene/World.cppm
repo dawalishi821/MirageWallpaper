@@ -161,7 +161,61 @@ struct SceneTexture {
     bool            isSprite { false };
     bool            isVideo { false };
     SpriteAnimation spriteAnim;
+    i32             width { 0 };
+    i32             height { 0 };
+    i32             content_width { 0 };
+    i32             content_height { 0 };
 };
+
+struct SceneUvRect {
+    float u_min { 0.0f };
+    float v_min { 0.0f };
+    float u_max { 1.0f };
+    float v_max { 1.0f };
+};
+
+inline SceneUvRect FullTextureUvRect(const SceneTexture& texture, bool nopadding = false) {
+    SceneUvRect rect;
+    if (! nopadding && texture.width > 0 && texture.height > 0 && texture.content_width > 0 &&
+        texture.content_height > 0) {
+        rect.u_max = std::clamp(static_cast<float>(texture.content_width) / texture.width,
+                                0.0f,
+                                1.0f);
+        rect.v_max = std::clamp(static_cast<float>(texture.content_height) / texture.height,
+                                0.0f,
+                                1.0f);
+    }
+    return rect;
+}
+
+inline SceneUvRect AspectFillTextureUvRect(const SceneTexture&         texture,
+                                           const std::array<float, 2>& target_size,
+                                           bool nopadding = false) {
+    auto rect = FullTextureUvRect(texture, nopadding);
+    if (target_size[0] <= 0.0f || target_size[1] <= 0.0f || texture.content_width <= 0 ||
+        texture.content_height <= 0)
+        return rect;
+
+    const float target_aspect = target_size[0] / target_size[1];
+    const float source_aspect =
+        static_cast<float>(texture.content_width) / texture.content_height;
+    if (! std::isfinite(target_aspect) || ! std::isfinite(source_aspect) ||
+        target_aspect <= 0.0f || source_aspect <= 0.0f)
+        return rect;
+
+    if (source_aspect < target_aspect) {
+        const float visible = source_aspect / target_aspect;
+        const float span    = rect.v_max * visible;
+        rect.v_min          = (rect.v_max - span) * 0.5f;
+        rect.v_max          = rect.v_min + span;
+    } else if (source_aspect > target_aspect) {
+        const float visible = target_aspect / source_aspect;
+        const float span    = rect.u_max * visible;
+        rect.u_min          = (rect.u_max - span) * 0.5f;
+        rect.u_max          = rect.u_min + span;
+    }
+    return rect;
+}
 
 // ============================================================================
 // SceneRenderTarget.h
@@ -206,6 +260,9 @@ struct SceneRenderTarget {
     bool preserve_on_write { false };
     bool hdr_format { false };
     bool inherit_scene_format { true };
+    // Derived by the renderer from graph accesses; conservative before planning.
+    bool transfer_source { true };
+    bool transfer_destination { true };
 
     i32 PhysicalWidth() const { return physical_width > 0 ? physical_width : width; }
     i32 PhysicalHeight() const { return physical_height > 0 ? physical_height : height; }
@@ -840,6 +897,18 @@ public:
     }
 
     SceneMaterial* Material() { return m_materials.empty() ? nullptr : m_materials[0].get(); }
+
+    bool SetCardTextureCoordinates(const SceneUvRect& rect) {
+        if (m_data->submeshes.empty() || m_data->submeshes[0].vertex_arrays.empty()) return false;
+        const std::array texcoords { rect.u_min, rect.v_min,
+                                     rect.u_min, rect.v_max,
+                                     rect.u_max, rect.v_min,
+                                     rect.u_max, rect.v_max };
+        if (! m_data->submeshes[0].vertex_arrays[0].SetVertex(WE_IN_TEXCOORD, texcoords))
+            return false;
+        SetDirty(SceneMeshDirtyData);
+        return true;
+    }
 
     const Eigen::Matrix4d& GeometryTransform() const { return m_data->geometry_transform; }
     void                   SetGeometryTransform(Eigen::Matrix4d transform) {
@@ -2478,6 +2547,7 @@ public:
                                 SceneRenderViewKind  = SceneRenderViewKind::Primary,
                                 SceneRenderAlphaMode = SceneRenderAlphaMode::Composite) = 0;
     virtual void FrameEnd()                                                        = 0;
+    virtual bool RequiresContinuousFrames() const { return true; }
 
     virtual void MouseInput(double x, double y)                     = 0;
     virtual void SetTexelSize(float x, float y)                     = 0;
@@ -2505,6 +2575,7 @@ public:
     virtual bool                   Contains(const std::string&) const = 0;
     virtual std::shared_ptr<Image> Parse(const std::string&)       = 0;
     virtual ImageHeader            ParseHeader(const std::string&) = 0;
+    virtual void                   ReleaseSyntheticImage(std::string_view) {}
 };
 
 struct SceneMaterialId {
@@ -2908,6 +2979,13 @@ public:
         std::string                                     fallback;
         Kind                                            kind { Kind::SceneTexture };
         std::optional<MaterialSolidColorNeutralization> solid_color;
+        struct AspectFill {
+            std::shared_ptr<SceneMesh> mesh;
+            std::array<float, 2>       target_size { 0.0f, 0.0f };
+            SceneUvRect                fallback_uv;
+            bool                       nopadding { false };
+        };
+        std::optional<AspectFill> aspect_fill;
     };
     Map<std::string, std::vector<MaterialTextureUserBinding>> material_texture_user_index;
 
@@ -2999,6 +3077,7 @@ public:
     void SetViewportScale(float scale) {
         viewport_scale = std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
     }
+    bool HasViewportScaleAnimation() const { return ! m_viewport_scale_curve.Empty(); }
     void SetViewportScaleAnimation(SceneAnimationCurve curve) {
         m_viewport_scale_curve = std::move(curve);
     }

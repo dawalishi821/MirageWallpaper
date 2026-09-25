@@ -68,7 +68,7 @@ struct ScreenSaverPage: SettingsPage {
                 LabeledContent("当前屏保壁纸", value: status.configuredTitle)
                 LabeledContent("正在播放", value: wallpaper.presentationIsValid ? wallpaper.project.title : "无")
                 Button("将正在播放的壁纸设为屏保") {
-                    perform { try configureCurrentWallpaper() }
+                    performLockScreenConfiguration { try await configureCurrentWallpaper() }
                 }
                 .disabled(!wallpaper.presentationIsValid || (wallpaper.kind != .video && wallpaper.kind != .scene))
             } header: {
@@ -103,6 +103,8 @@ struct ScreenSaverPage: SettingsPage {
                 if let registrationErrorMessage = dynamicLockScreenManager.registrationErrorMessage {
                     Text(registrationErrorMessage)
                         .foregroundStyle(.red)
+                }
+                if dynamicLockScreenManager.canRetryConnection {
                     Button(LocalizedStringKey("重试动态锁屏连接")) {
                         dynamicLockScreenManager.retryConnection()
                     }
@@ -168,13 +170,24 @@ struct ScreenSaverPage: SettingsPage {
         }
     }
 
-    private func configureCurrentWallpaper() throws {
-        try manager.configure(
-            with: wallpaperViewModel.currentWallpaper,
-            runtime: wallpaperViewModel.runtime,
-            properties: wallpaperViewModel.effectiveProperties(for: wallpaperViewModel.currentWallpaper),
-            fps: Int(viewModel.settings.fps)
-        )
+    private func configureCurrentWallpaper() async throws {
+        let wallpaper = wallpaperViewModel.currentWallpaper
+        let requestedAt = ProcessInfo.processInfo.systemUptime
+        await wallpaperViewModel.refreshScriptStorage(for: wallpaper)
+        let runtime = wallpaperViewModel.loadRuntime(for: wallpaper)
+        let properties = wallpaperViewModel.effectiveProperties(for: wallpaper, runtime: runtime)
+        let fps = Int(viewModel.settings.fps)
+        var context = ScreenSaverManager.ConfigurationContext(wallpaperID: wallpaper.id, runtime: runtime, fps: fps)
+        context.capturedAt = requestedAt
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(with: Result {
+                    try manager.configure(with: wallpaper, runtime: runtime, properties: properties,
+                                          fps: fps, context: context)
+                })
+            }
+        }
+        wallpaperViewModel.saveRuntime()
     }
 
     private func configureCurrentDynamicLockScreen() async throws {

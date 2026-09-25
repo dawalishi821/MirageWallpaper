@@ -28,7 +28,7 @@ struct WorkshopItemCard: View {
                 isAnimating: isActive && (isHovered || isSelected ||
                     animatedPreviewMode == .visible),
                 isLoadingEnabled: isActive,
-                preloadsWhenInactive: true
+                preloadsWhenInactive: false
             )
 
             captionStrip

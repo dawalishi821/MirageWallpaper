@@ -78,7 +78,12 @@ struct WorkshopView: View {
                     DownloadPopover(workshopViewModel: workshopViewModel)
                 }
 
-                steamAccountSection
+                if workshopViewModel.directDownloadMode {
+                    Label("免登录下载已开启", systemImage: "arrow.down.circle.badge.checkmark")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    steamAccountSection
+                }
             }
 
             if workshopViewModel.steamSetupState != .ready {
@@ -253,10 +258,11 @@ struct WorkshopView: View {
                 }
             }
         }
-        .onAppear {
+        .task(id: isActive) {
+            guard isActive else { return }
             presentAPIKeyReminderIfNeeded()
             workshopViewModel.checkSteamSetup()
-            if workshopViewModel.items.isEmpty {
+            if workshopViewModel.items.isEmpty && !workshopViewModel.isLoading {
                 workshopViewModel.search()
             }
         }

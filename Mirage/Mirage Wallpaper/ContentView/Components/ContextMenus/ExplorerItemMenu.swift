@@ -110,7 +110,7 @@ struct ExplorerItemMenu: SubviewOfContentView {
                         systemImage: isFavorite ? "heart.slash.fill" : "heart.fill"
                     )
                 }
-                .disabled(workshopID.map { workshopViewModel.changingFavoriteIDs.contains($0) } == true)
+                .disabled(workshopID.map { workshopViewModel.directDownloadMode || workshopViewModel.changingFavoriteIDs.contains($0) } == true)
             }
             
             Section {
@@ -166,6 +166,16 @@ struct ExplorerItemMenu: SubviewOfContentView {
                     } label: {
                         Label(LocalizedStringKey("移除快捷键"), systemImage: "command.square.fill")
                     }
+                }
+                if hoveredWallpaper.kind == .scene,
+                   let resources = Bundle.main.resourceURL,
+                   FileManager.default.fileExists(atPath: resources.appending(path: "SceneDiagnostics/manifest.json").path) {
+                    Button {
+                        wallpaperViewModel.diagnoseSceneColors(hoveredWallpaper)
+                    } label: {
+                        Label("场景颜色诊断", systemImage: "stethoscope")
+                    }
+                    .disabled(!canApply)
                 }
                 Button {
                     NSWorkspace.shared.selectFile(nil,
@@ -316,10 +326,19 @@ struct ExplorerItemMenu: SubviewOfContentView {
 
     private func setAsScreenSaver() {
         let wallpaper = hoveredWallpaper
+        let requestedAt = ProcessInfo.processInfo.systemUptime
+        Task { @MainActor in
+            await wallpaperViewModel.refreshScriptStorage(for: wallpaper)
+            configureScreenSaver(wallpaper, requestedAt: requestedAt)
+        }
+    }
+
+    private func configureScreenSaver(_ wallpaper: WEWallpaper, requestedAt: TimeInterval) {
         let runtime = wallpaperViewModel.loadRuntime(for: wallpaper)
         let properties = wallpaperViewModel.effectiveProperties(for: wallpaper, runtime: runtime)
         let fps = Int(AppDelegate.shared.globalSettingsViewModel.settings.fps)
-        let context = ScreenSaverManager.ConfigurationContext(wallpaperID: wallpaper.id, runtime: runtime, fps: fps)
+        var context = ScreenSaverManager.ConfigurationContext(wallpaperID: wallpaper.id, runtime: runtime, fps: fps)
+        context.capturedAt = requestedAt
         let manager = ScreenSaverManager.shared
         let needsInstallation = !manager.isInstalled
 
@@ -337,11 +356,13 @@ struct ExplorerItemMenu: SubviewOfContentView {
             DispatchQueue.main.async {
                 switch result {
                 case .success:
+                    wallpaperViewModel.saveRuntime()
                     viewModel.screenSaverFeedback = ScreenSaverFeedback(
                         title: "已设为屏保",
                         message: "“\(wallpaper.project.title)”将在下次启动屏保时显示。"
                     )
                 case .failure(let error):
+                    guard !(error is CancellationError) else { return }
                     viewModel.screenSaverFeedback = ScreenSaverFeedback(
                         title: "设置屏保失败",
                         message: error.localizedDescription
@@ -456,6 +477,7 @@ struct ExplorerItemMenu: SubviewOfContentView {
 
 struct WorkshopCardContextMenu: View {
     let item: WorkshopItem
+    private let directDownloadMode: Bool
     private let isSubscribed: Bool
     private let isSubscribeDisabled: Bool
     private let isUnsubscribeDisabled: Bool
@@ -473,6 +495,7 @@ struct WorkshopCardContextMenu: View {
 
     init(item: WorkshopItem, workshopViewModel: WorkshopViewModel) {
         self.item = item
+        self.directDownloadMode = workshopViewModel.directDownloadMode
 
         // Read all menu state once, while SwiftUI is constructing the menu.
         // The resulting native menu is intentionally a snapshot; live progress
@@ -510,7 +533,9 @@ struct WorkshopCardContextMenu: View {
     var body: some View {
         Group {
             Section {
-                if isSubscribed {
+                if directDownloadMode {
+                    Label("免登录下载已开启", systemImage: "arrow.down.circle")
+                } else if isSubscribed {
                     Button(role: .destructive) {
                         onUnsubscribe()
                     } label: {
@@ -544,7 +569,9 @@ struct WorkshopCardContextMenu: View {
             }
 
             Section {
-                if isChangingFavorite {
+                if directDownloadMode {
+                    Label("免登录模式仅支持下载，请关闭此模式并登录 Steam 以使用社区功能", systemImage: "info.circle")
+                } else if isChangingFavorite {
                     Label("正在同步收藏状态…", systemImage: "arrow.triangle.2.circlepath")
                 } else {
                     Button {

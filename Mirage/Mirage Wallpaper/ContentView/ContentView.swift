@@ -81,6 +81,7 @@ struct ContentView: View {
     @StateObject private var steamSetupViewModel = SteamSetupViewModel()
     @State private var loadedSections: Set<MainSection>
     @State private var pendingSceneFileExport: WEWallpaper?
+    @State private var hasPresentedUI = false
 
     init(
         viewModel: ContentViewModel,
@@ -97,9 +98,10 @@ struct ContentView: View {
 
     var body: some View {
         @Bindable var globalSettingsViewModel = globalSettingsViewModel
+        let interfaceActive = viewModel.isStaging && viewModel.isWindowVisible
         ZStack {
             HSplitView {
-                if viewModel.isStaging {
+                if hasPresentedUI || viewModel.isStaging {
                     VStack(spacing: 5) {
                         TopTabBar(navigationModel: navigationModel,
                                   wallpaperViewModel: wallpaperViewModel)
@@ -115,7 +117,7 @@ struct ContentView: View {
                                         WallpaperExplorer(
                                             contentViewModel: viewModel,
                                             wallpaperViewModel: wallpaperViewModel,
-                                            isActive: navigationModel.selection == .installed,
+                                            isActive: interfaceActive && navigationModel.selection == .installed,
                                             animatedPreviewMode: globalSettingsViewModel.animatedPreviewPlaybackMode
                                         )
                                         .onDrop(of: [.fileURL], delegate: viewModel)
@@ -127,7 +129,8 @@ struct ContentView: View {
                                         }
                                     })
                                     ExplorerBottomBar(contentViewModel: viewModel,
-                                                      wallpaperViewModel: wallpaperViewModel)
+                                                      wallpaperViewModel: wallpaperViewModel,
+                                                      isActive: interfaceActive && navigationModel.selection == .installed)
                                 }
                                 .sectionVisibility(navigationModel.selection == .installed)
                             }
@@ -138,7 +141,7 @@ struct ContentView: View {
                                     viewModel: viewModel,
                                     wallpaperViewModel: wallpaperViewModel,
                                     navigationModel: navigationModel,
-                                    isActive: navigationModel.selection == .discover
+                                    isActive: interfaceActive && navigationModel.selection == .discover
                                 )
                                 .sectionVisibility(navigationModel.selection == .discover)
                             }
@@ -151,7 +154,7 @@ struct ContentView: View {
                                         workshopViewModel: workshopViewModel,
                                         viewModel: viewModel,
                                         wallpaperViewModel: wallpaperViewModel,
-                                        isActive: navigationModel.selection == .workshop
+                                        isActive: interfaceActive && navigationModel.selection == .workshop
                                     )
                                 })
                                 .sectionVisibility(navigationModel.selection == .workshop)
@@ -165,7 +168,7 @@ struct ContentView: View {
                                         workshopViewModel: workshopViewModel,
                                         viewModel: viewModel,
                                         wallpaperViewModel: wallpaperViewModel,
-                                        isActive: navigationModel.selection == .subscriptions
+                                        isActive: interfaceActive && navigationModel.selection == .subscriptions
                                     )
                                 })
                                 .sectionVisibility(navigationModel.selection == .subscriptions)
@@ -181,7 +184,8 @@ struct ContentView: View {
                         WallpaperPreview(contentViewModel: viewModel,
                                         wallpaperViewModel: wallpaperViewModel,
                                         workshopViewModel: workshopViewModel,
-                                        isActive: navigationModel.selection == .installed || workshopViewModel.showCustomization)
+                                        isActive: interfaceActive && !workshopViewModel.showCreatorProfile &&
+                                            (navigationModel.selection == .installed || workshopViewModel.showCustomization))
                             .frame(maxWidth: 320)
                             .sectionVisibility(
                                 workshopViewModel.showCreatorProfile == false &&
@@ -191,7 +195,8 @@ struct ContentView: View {
                         WorkshopItemDetail(
                             item: workshopViewModel.selectedItem,
                             workshopViewModel: workshopViewModel,
-                            isActive: navigationModel.selection != .installed && workshopViewModel.showCustomization == false
+                            isActive: interfaceActive && !workshopViewModel.showCreatorProfile &&
+                                navigationModel.selection != .installed && workshopViewModel.showCustomization == false
                         )
                             .frame(maxWidth: 320)
                             .sectionVisibility(
@@ -361,21 +366,15 @@ struct ContentView: View {
             MobileTransferOverlay()
         }
         .environment(\.locale, localization.locale)
+        .environment(\.mirageContentActive, interfaceActive)
         .frame(minWidth: 1100, minHeight: 640)
         .onChange(of: navigationModel.selection) { _, section in
-            loadedSections.insert(section)
+            if viewModel.isStaging { loadedSections.insert(section) }
         }
         .task(id: viewModel.isStaging) {
             guard viewModel.isStaging else { return }
-            for section in MainSection.allCases where !loadedSections.contains(section) {
-                do {
-                    try await Task.sleep(for: .milliseconds(250))
-                } catch {
-                    return
-                }
-                guard !Task.isCancelled else { return }
-                loadedSections.insert(section)
-            }
+            hasPresentedUI = true
+            loadedSections.insert(navigationModel.selection)
         }
     }
 }

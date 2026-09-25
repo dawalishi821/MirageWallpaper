@@ -8,6 +8,30 @@ import AppKit
 import CryptoKit
 import Darwin
 import Foundation
+import ImageIO
+
+private final class MiragePreviewCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var action: (() -> Void)?
+    private var cancelled = false
+
+    func install(_ action: @escaping () -> Void) {
+        lock.lock()
+        let shouldCancel = cancelled
+        if !shouldCancel { self.action = action }
+        lock.unlock()
+        if shouldCancel { action() }
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let action = self.action
+        self.action = nil
+        lock.unlock()
+        action?()
+    }
+}
 
 struct DynamicLockScreenDisplayConfiguration: Codable {
     let displayID: UInt32
@@ -19,26 +43,44 @@ struct DynamicLockScreenDisplayConfiguration: Codable {
     let previewPath: String?
     var desktopFallbackPath: String?
     var systemFallbackPath: String?
-    let rawProperties: [String: AnyCodableValue]
+    var rawProperties: [String: AnyCodableValue]
     let fps: Int
     var fillMode: String
     var position: WallpaperPosition? = nil
     var loadFromMemory: Bool?
+    var renderedPreviewPath: String? = nil
+    var displayKey: String? = nil
+    var speed: Float? = nil
+    var scriptStorage: [String: String]? = nil
+    var runtimeRevision: UUID? = nil
 }
 
 struct DynamicLockScreenConfiguration: Codable {
     let version: Int
     var enabled: Bool?
     var displays: [String: DynamicLockScreenDisplayConfiguration]
+    var configuredAt: TimeInterval? = nil
+    var configurationSession: String? = nil
 }
 
-enum AnyCodableValue: Codable {
+enum AnyCodableValue: Codable, Equatable, Sendable {
     case string(String)
     case number(Double)
     case bool(Bool)
     case object([String: AnyCodableValue])
     case array([AnyCodableValue])
     case null
+
+    var foundationValue: Any {
+        switch self {
+        case .string(let value): return value
+        case .number(let value): return value
+        case .bool(let value): return value
+        case .object(let value): return value.mapValues(\.foundationValue)
+        case .array(let value): return value.map(\.foundationValue)
+        case .null: return NSNull()
+        }
+    }
 
     init(_ value: Any) {
         switch value {
@@ -85,7 +127,7 @@ final class DynamicLockScreenManager: ObservableObject {
     @Published private(set) var connectionState = ConnectionState.disabled
 
     enum ConnectionState {
-        case disabled, needsWallpaper, preparing, registered, connected, ready, failed
+        case disabled, needsWallpaper, preparing, awaitingSystemSettings, awaitingSelection, connected, ready, failed
     }
 
     private let enabledKey = "Mirage.DynamicLockScreen.Enabled"
@@ -95,19 +137,27 @@ final class DynamicLockScreenManager: ObservableObject {
     private let registeredExtensionFingerprintKey =
         "Mirage.DynamicLockScreen.RegisteredExtensionFingerprint"
     private let extensionQueue = WallpaperServiceCoordinator.queue
+    private let registrationQueue = DispatchQueue(label: "cn.laobamac.Mirage.dynamicLockScreen.registration", qos: .utility)
     private let extensionRequests = WallpaperExtensionRequest()
+    private var requiresSettingsAcknowledgement = false
     private var activeProbe: (probe: MirageLockProbe, url: URL, fingerprint: String, container: URL)?
     private let configurationUpdates = CoalescingWorkQueue(label: "cn.laobamac.Mirage.dynamicLockScreen.configuration")
     private let statusUpdates = CoalescingWorkQueue(label: "cn.laobamac.Mirage.dynamicLockScreen.status")
     private let configurationLock = NSRecursiveLock()
     private let deploymentQueue = DispatchQueue(label: "cn.laobamac.Mirage.dynamicLockScreen.deployment", qos: .userInitiated)
+    private let previewQueue = DispatchQueue(label: "cn.laobamac.Mirage.dynamicLockScreen.preview", qos: .utility)
     private var configurationRequestID: UUID?
+    private var previewTask: Task<Void, Never>?
 
-    struct DisplaySnapshot {
+    struct DisplaySnapshot: Sendable {
         let displayID: UInt32
         let fallbackSource: URL?
         let systemFallbackSource: URL?
         let position: WallpaperPosition
+        var renderedPreviewSource: URL? = nil
+        var displayKey: String? = nil
+        var runtime: WallpaperRenderSnapshot? = nil
+        var runtimeRevision: UUID? = nil
     }
 
     struct PreparedConfiguration {
@@ -138,10 +188,18 @@ final class DynamicLockScreenManager: ObservableObject {
         case .disabled: return L("动态锁屏已关闭")
         case .needsWallpaper: return L("已启用，请设置锁屏壁纸")
         case .preparing: return L("正在连接动态锁屏")
-        case .registered: return L("已注册，等待系统载入动态锁屏")
+        case .awaitingSystemSettings: return L("请打开系统墙纸设置以载入动态锁屏")
+        case .awaitingSelection: return L("动态锁屏已载入，请在系统墙纸设置中选择 Mirage")
         case .connected: return L("动态锁屏已连接，等待画面就绪")
         case .ready: return L("动态锁屏已就绪")
         case .failed: return L("动态锁屏恢复失败")
+        }
+    }
+
+    var canRetryConnection: Bool {
+        switch connectionState {
+        case .awaitingSystemSettings, .awaitingSelection, .connected, .failed: return true
+        default: return false
         }
     }
 
@@ -204,6 +262,7 @@ final class DynamicLockScreenManager: ObservableObject {
             UserDefaults.standard.set(false, forKey: enabledKey)
             DynamicLockScreenModeStore.deactivate(.extensionMode)
             extensionRequests.cancel()
+            requiresSettingsAcknowledgement = false
             activeProbe = nil
             connectionState = .disabled
             registrationErrorMessage = nil
@@ -233,23 +292,32 @@ final class DynamicLockScreenManager: ObservableObject {
                                    fps: Int,
                                    displayIDs: [UInt32]) async throws {
         guard canUse else { throw DynamicLockScreenError.notEnabled }
-        guard let container = sharedContainerURL else { throw DynamicLockScreenError.appGroupUnavailable }
-        let positions = AppDelegate.shared.wallpaperViewModel.positions(for: wallpaper.id)
-        let displays = Array(Set(displayIDs)).map { displayID in
-            DisplaySnapshot(
-                displayID: displayID,
-                fallbackSource: DesktopOverrideService.shared.dynamicLockScreenFallbackURL(forDisplay: displayID),
-                systemFallbackSource: DesktopOverrideService.shared.dynamicLockScreenSystemFallbackURL(forDisplay: displayID),
-                position: DisplayRegistry.shared.info(forDisplay: displayID).flatMap {
-                    positions[$0.key.rawValue]
-                } ?? .center)
+        guard wallpaper.isValid else { throw DynamicLockScreenError.noWallpaper }
+        guard wallpaper.kind == .video || wallpaper.kind == .scene else {
+            throw DynamicLockScreenError.unsupportedWallpaper
         }
-        let loadFromMemory = (AppDelegate.shared.globalSettingsViewModel.settings.wallpaperLoadSource ?? .disk) == .memory
+        guard let container = sharedContainerURL else { throw DynamicLockScreenError.appGroupUnavailable }
         let requestID = UUID()
         configurationRequestID = requestID
         defer {
             if configurationRequestID == requestID { configurationRequestID = nil }
         }
+        let model = AppDelegate.shared.wallpaperViewModel
+        await model.refreshScriptStorage(for: wallpaper)
+        guard configurationRequestID == requestID, canUse, !Task.isCancelled else { throw CancellationError() }
+        let positions = model.positions(for: wallpaper.id)
+        let snapshots = model.renderSnapshots(for: wallpaper.id)
+        let displays = Array(Set(displayIDs)).map { displayID in
+            let displayKey = DisplayRegistry.shared.info(forDisplay: displayID)?.key.rawValue
+            return DisplaySnapshot(
+                displayID: displayID,
+                fallbackSource: DesktopOverrideService.shared.dynamicLockScreenFallbackURL(forDisplay: displayID),
+                systemFallbackSource: DesktopOverrideService.shared.dynamicLockScreenSystemFallbackURL(forDisplay: displayID),
+                position: displayKey.flatMap { positions[$0] } ?? .center,
+                displayKey: displayKey,
+                runtime: displayKey.flatMap { snapshots[$0] })
+        }
+        let loadFromMemory = (AppDelegate.shared.globalSettingsViewModel.settings.wallpaperLoadSource ?? .disk) == .memory
         let prepared: PreparedConfiguration
         do {
             prepared = try await withCheckedThrowingContinuation { continuation in
@@ -285,6 +353,127 @@ final class DynamicLockScreenManager: ObservableObject {
         cleanupDeployments(except: prepared.root)
         cleanupDesktopFallbacks()
         registerExtension()
+        let committedConfiguration = try JSONDecoder().decode(DynamicLockScreenConfiguration.self, from: prepared.data)
+        refreshRuntimePreviews(wallpaper: wallpaper, configuration: committedConfiguration)
+        for (key, snapshot) in model.renderSnapshots(for: wallpaper.id) {
+            guard let id = DisplayRegistry.shared.displayID(for: DisplayKey(rawValue: key)) else { continue }
+            updateRuntime(snapshot, wallpaper: wallpaper, displayKey: key, displayID: id)
+        }
+    }
+
+    private func startPreviewUpdate(for wallpaper: WEWallpaper, runtime: WallpaperRuntimeState,
+                                    properties: [String: WEProjectProperty], fps: Int,
+                                    displays: [DisplaySnapshot], loadFromMemory: Bool,
+                                    deployment: URL, configurationURL: URL) {
+        previewTask?.cancel()
+        previewTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do { try await Task.sleep(for: .milliseconds(500)) } catch { return }
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("mirage-lock-preview-\(UUID().uuidString)", isDirectory: true)
+            defer { previewQueue.async { try? FileManager.default.removeItem(at: directory) } }
+            let captured = await capturePreviews(for: wallpaper, runtime: runtime, properties: properties,
+                                                 fps: fps, displays: displays, loadFromMemory: loadFromMemory,
+                                                 directory: directory)
+            guard !Task.isCancelled else { return }
+            let lock = configurationLock
+            let updated = await withCheckedContinuation { continuation in
+                previewQueue.async {
+                    let images = captured.compactMap { display -> (DisplaySnapshot, Data)? in
+                        guard let source = display.renderedPreviewSource,
+                              let data = Self.renderedPreviewData(source: source) else { return nil }
+                        return (display, data)
+                    }
+                    lock.lock()
+                    defer { lock.unlock() }
+                    continuation.resume(returning: Self.publishPreviews(images, deployment: deployment,
+                        configurationURL: configurationURL, wallpaperID: wallpaper.id, fillMode: runtime.fillMode))
+                }
+            }
+            if updated { MirageLockBridge.post(MirageLockBridge.previewNotification) }
+        }
+    }
+
+    nonisolated static func publishPreviews(_ images: [(DisplaySnapshot, Data)], deployment: URL,
+                                            configurationURL: URL, wallpaperID: String, fillMode: FillMode) -> Bool {
+        guard let data = try? Data(contentsOf: configurationURL),
+              let configuration = try? JSONDecoder().decode(DynamicLockScreenConfiguration.self, from: data),
+              configuration.enabled != false else { return false }
+        var updated = false
+        for (snapshot, image) in images {
+            let url = renderedPreviewURL(displayID: snapshot.displayID, in: deployment)
+            guard let display = configuration.displays["display-\(snapshot.displayID)"],
+                  display.wallpaperID == wallpaperID,
+                  display.fillMode == (snapshot.runtime?.fillMode ?? fillMode.rawValue),
+                  (snapshot.runtimeRevision == nil || display.runtimeRevision == snapshot.runtimeRevision),
+                  (display.position ?? .center) == snapshot.position,
+                  display.renderedPreviewPath == url.path,
+                  URL(fileURLWithPath: display.renderDirectory).deletingLastPathComponent().standardizedFileURL
+                    == deployment.standardizedFileURL else { continue }
+            if (try? image.write(to: url, options: .atomic)) != nil { updated = true }
+        }
+        return updated
+    }
+
+    private func capturePreviews(for wallpaper: WEWallpaper, runtime: WallpaperRuntimeState,
+                                 properties: [String: WEProjectProperty], fps: Int,
+                                 displays: [DisplaySnapshot], loadFromMemory: Bool,
+                                 directory: URL) async -> [DisplaySnapshot] {
+        guard (try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)) != nil else {
+            return displays
+        }
+        let renderer = AppDelegate.shared.wallpaperViewModel.renderer
+        return await withTaskGroup(of: DisplaySnapshot.self) { group in
+            for display in displays {
+                group.addTask { @MainActor in
+                    var result = display
+                    guard !Task.isCancelled else { return result }
+                    let url = directory.appendingPathComponent("display-\(display.displayID).heic")
+                    var options = RenderOptions()
+                    options.fps = min(max(fps, 10), 60)
+                    options.muted = true
+                    options.fillMode = display.runtime.flatMap { FillMode(rawValue: $0.fillMode) } ?? runtime.fillMode
+                    options.position = display.position
+                    options.speed = display.runtime?.speed ?? runtime.speed
+                    options.scriptStorage = display.runtime?.scriptStorage
+                    options.loadFromMemory = loadFromMemory
+                    options.userProperties = display.runtime?.properties(for: wallpaper) ?? properties
+                    if let key = display.displayKey.map(DisplayKey.init(rawValue:)),
+                       let active = AppDelegate.shared.wallpaperViewModel.state(for: key),
+                       active.wallpaper.id == wallpaper.id,
+                       active.runtime.position == options.position,
+                       active.runtime.fillMode == options.fillMode,
+                       active.runtime.speed == options.speed,
+                       WallpaperPropertyEncoding.values(AppDelegate.shared.wallpaperViewModel.effectiveProperties(
+                        for: wallpaper, runtime: active.runtime)).mapValues(AnyCodableValue.init)
+                        == WallpaperPropertyEncoding.values(options.userProperties).mapValues(AnyCodableValue.init) {
+                        let captured = await withCheckedContinuation { continuation in
+                            renderer.snapshot(onDisplay: display.displayID, path: url.path) {
+                                continuation.resume(returning: $0)
+                            }
+                        }
+                        if captured { result.renderedPreviewSource = url; return result }
+                    }
+                    let cancellation = MiragePreviewCancellation()
+                    let captured = await withTaskCancellationHandler {
+                        await withCheckedContinuation { continuation in
+                            let token = renderer.snapshot(wallpaper: wallpaper, onDisplay: display.displayID,
+                                                          options: options, path: url.path) {
+                                continuation.resume(returning: $0)
+                            }
+                            cancellation.install { renderer.cancelPreview(token) }
+                        }
+                    } onCancel: {
+                        cancellation.cancel()
+                    }
+                    if captured { result.renderedPreviewSource = url }
+                    return result
+                }
+            }
+            var results: [DisplaySnapshot] = []
+            for await result in group { results.append(result) }
+            return results
+        }
     }
 
     private func commitConfiguration(_ prepared: PreparedConfiguration, in container: URL) throws {
@@ -337,39 +526,22 @@ final class DynamicLockScreenManager: ObservableObject {
         defer {
             if !keepDeployment { try? FileManager.default.removeItem(at: deployment.root) }
         }
-        var rawPropertyValues: [String: Any] = [:]
-        for (key, property) in properties where wallpaper.kind == .scene {
-            switch property.propertyType {
-            case .color:
-                rawPropertyValues[key] = ["type": "color", "value": property.value.stringValue]
-            case .bool:
-                rawPropertyValues[key] = property.value.boolValue
-            case .slider:
-                rawPropertyValues[key] = property.value.doubleValue
-            case .scenetexture, .file:
-                let value = try deployPropertyAsset(property.value.stringValue, key: key, in: deployment.root)
-                rawPropertyValues[key] = ["type": "scenetexture", "value": deployedPath(value)]
-            case .combo:
-                rawPropertyValues[key] = property.value.jsonObjectValue
-            case .usershortcut:
-                var value: [String: Any] = [
-                    "type": "usershortcut",
-                    "value": property.value.stringValue
-                ]
-                if let icon = property.mirageShortcutIcon {
-                    value["icon"] = deployedPath(try deployPropertyAsset(
-                        icon, key: "\(key)-icon", in: deployment.root))
-                }
-                rawPropertyValues[key] = value
-            default:
-                rawPropertyValues[key] = property.value.stringValue
-            }
-        }
+        let storedStorage = WallpaperRenderSnapshot.storedScriptStorage(for: wallpaper)
+        let fallbackRuntime = WallpaperRenderSnapshot(runtime: runtime, properties: properties,
+                                                       scriptStorage: storedStorage)
+        let revision = UUID()
         let configuration = DynamicLockScreenConfiguration(
             version: 2,
             enabled: true,
-            displays: Dictionary(uniqueKeysWithValues: displays.map { display in
+            displays: Dictionary(uniqueKeysWithValues: try displays.map { display in
+                let snapshot = display.runtime ?? fallbackRuntime
+                let rawProperties = try deployedProperties(snapshot.rawProperties, in: deployment.root,
+                                                           publishedRoot: root)
                 let displayID = display.displayID
+                let previewURL = renderedPreviewURL(displayID: displayID, in: deployment.root)
+                if let source = display.renderedPreviewSource, let data = renderedPreviewData(source: source) {
+                    try? data.write(to: previewURL, options: .atomic)
+                }
                 let fallbackSource = display.fallbackSource
                 let fallbackURL = fallbackSource.flatMap {
                     try? deployDesktopFallback(source: $0, displayID: displayID, in: container,
@@ -393,21 +565,103 @@ final class DynamicLockScreenManager: ObservableObject {
                     kind: wallpaper.kind.rawValue,
                     renderDirectory: deployedPath(deployment.renderDirectory.path),
                     entryPath: deployedPath(deployment.entryURL.path),
-                    previewPath: deployment.previewURL.map { deployedPath($0.path) },
+                    previewPath: deployedPath(previewURL.path),
                     desktopFallbackPath: fallbackURL.map { deployedPath($0.path) },
                     systemFallbackPath: systemFallbackURL.map { deployedPath($0.path) },
-                    rawProperties: rawPropertyValues.mapValues(AnyCodableValue.init),
+                    rawProperties: rawProperties,
                     fps: min(max(fps, 10), 60),
-                    fillMode: runtime.fillMode.rawValue,
+                    fillMode: snapshot.fillMode,
                     position: display.position,
-                    loadFromMemory: loadFromMemory
+                    loadFromMemory: loadFromMemory,
+                    renderedPreviewPath: deployedPath(previewURL.path),
+                    displayKey: display.displayKey,
+                    speed: snapshot.speed,
+                    scriptStorage: snapshot.scriptStorage ?? storedStorage,
+                    runtimeRevision: revision
                 )
                 return ("display-\(displayID)", record)
-            })
+            }),
+            configuredAt: ProcessInfo.processInfo.systemUptime,
+            configurationSession: WallpaperRenderSnapshot.configurationSession
         )
         let data = try JSONEncoder().encode(configuration)
         keepDeployment = true
         return PreparedConfiguration(stagingRoot: deployment.root, root: root, data: data)
+    }
+
+    func updateRuntime(_ snapshot: WallpaperRenderSnapshot, wallpaper: WEWallpaper,
+                       displayKey: String, displayID: UInt32) {
+        guard let configurationURL else { return }
+        let requestedAt = ProcessInfo.processInfo.systemUptime
+        let lock = configurationLock
+        configurationUpdates.submit(key: "runtime:\(displayKey)") { [weak self] in
+            lock.lock()
+            defer { lock.unlock() }
+            do {
+                if let configuration = try Self.updateRuntime(snapshot, wallpaper: wallpaper,
+                    displayKey: displayKey, displayID: displayID, configurationURL: configurationURL,
+                    requestedAt: requestedAt) {
+                    Self.postConfigurationChanged()
+                    Task { @MainActor [weak self] in
+                        self?.refreshRuntimePreviews(wallpaper: wallpaper, configuration: configuration)
+                    }
+                }
+            } catch {
+                NSLog("[Mirage] Lock screen runtime update failed: %@", error.localizedDescription)
+            }
+        }
+    }
+
+    nonisolated static func updateRuntime(_ snapshot: WallpaperRenderSnapshot, wallpaper: WEWallpaper,
+                                          displayKey: String, displayID: UInt32,
+                                          configurationURL: URL,
+                                          requestedAt: TimeInterval = ProcessInfo.processInfo.systemUptime) throws -> DynamicLockScreenConfiguration? {
+        guard FileManager.default.fileExists(atPath: configurationURL.path) else { return nil }
+        let data = try Data(contentsOf: configurationURL)
+        var configuration = try JSONDecoder().decode(DynamicLockScreenConfiguration.self, from: data)
+        guard configuration.configurationSession != WallpaperRenderSnapshot.configurationSession ||
+            (configuration.configuredAt ?? 0) <= requestedAt else { return nil }
+        guard let key = configuration.displays.first(where: {
+            $0.value.wallpaperID == wallpaper.id &&
+                ($0.value.displayKey == displayKey || ($0.value.displayKey == nil && $0.value.displayID == displayID))
+        })?.key, var display = configuration.displays[key] else { return nil }
+        let root = URL(fileURLWithPath: display.renderDirectory).deletingLastPathComponent()
+        let properties = try deployedProperties(snapshot.rawProperties, in: root, publishedRoot: root)
+        let storage = snapshot.scriptStorage ?? WallpaperRenderSnapshot.storedScriptStorage(for: wallpaper)
+        guard properties != display.rawProperties || display.fillMode != snapshot.fillMode ||
+            (display.position ?? .center) != snapshot.position || (display.speed ?? 1) != snapshot.speed ||
+            display.scriptStorage != storage else { return nil }
+        display.rawProperties = properties
+        display.fillMode = snapshot.fillMode
+        display.position = snapshot.position
+        display.speed = snapshot.speed
+        display.scriptStorage = storage
+        display.displayKey = displayKey
+        display.runtimeRevision = UUID()
+        configuration.displays[key] = display
+        try JSONEncoder().encode(configuration).write(to: configurationURL, options: .atomic)
+        return configuration
+    }
+
+    private func refreshRuntimePreviews(wallpaper: WEWallpaper, configuration: DynamicLockScreenConfiguration) {
+        guard isEnabled, configuration.enabled != false,
+              let display = configuration.displays.values.first(where: { $0.wallpaperID == wallpaper.id }),
+              let configurationURL else { return }
+        let snapshots = configuration.displays.values.filter { $0.wallpaperID == wallpaper.id }.map { record in
+            var runtime = WallpaperRenderSnapshot(runtime: WallpaperRuntimeState(), properties: [:],
+                                                  scriptStorage: record.scriptStorage)
+            runtime.rawProperties = record.rawProperties
+            runtime.fillMode = record.fillMode
+            runtime.position = record.position ?? .center
+            runtime.speed = record.speed ?? 1
+            return DisplaySnapshot(displayID: record.displayID, fallbackSource: nil, systemFallbackSource: nil,
+                                   position: runtime.position, displayKey: record.displayKey, runtime: runtime,
+                                   runtimeRevision: record.runtimeRevision)
+        }
+        let root = URL(fileURLWithPath: display.renderDirectory).deletingLastPathComponent()
+        startPreviewUpdate(for: wallpaper, runtime: WallpaperRuntimeState(), properties: [:],
+                           fps: display.fps, displays: snapshots, loadFromMemory: display.loadFromMemory ?? false,
+                           deployment: root, configurationURL: configurationURL)
     }
 
     func updatePosition(_ position: WallpaperPosition, fillMode: FillMode,
@@ -536,6 +790,8 @@ final class DynamicLockScreenManager: ObservableObject {
     }
 
     func clearConfiguration() {
+        previewTask?.cancel()
+        previewTask = nil
         configurationRequestID = nil
         registrationErrorMessage = nil
         if !isEnabled { connectionState = .disabled }
@@ -558,6 +814,13 @@ final class DynamicLockScreenManager: ObservableObject {
     }
 
     func openSystemSettings() {
+        if canUse, isConfigured {
+            restoreConfigurationAndRegister(requireAcknowledgement: true)
+        }
+        showSystemSettings()
+    }
+
+    private func showSystemSettings() {
         guard let url = URL(string: "x-apple.systempreferences:com.apple.Wallpaper-Settings.extension") else { return }
         NSWorkspace.shared.open(url)
     }
@@ -584,7 +847,7 @@ final class DynamicLockScreenManager: ObservableObject {
         return FileManager.default.fileExists(atPath: cache.path) ? cache : source
     }
 
-    private nonisolated static func deploy(wallpaper: WEWallpaper, in container: URL) throws -> (root: URL, renderDirectory: URL, entryURL: URL, previewURL: URL?) {
+    private nonisolated static func deploy(wallpaper: WEWallpaper, in container: URL) throws -> (root: URL, renderDirectory: URL, entryURL: URL) {
         let deployments = container.appendingPathComponent("DynamicLockScreen/Staging", isDirectory: true)
         let root = deployments.appendingPathComponent(UUID().uuidString.lowercased(), isDirectory: true)
         do {
@@ -617,36 +880,72 @@ final class DynamicLockScreenManager: ObservableObject {
                 entryURL = renderDirectory.appendingPathComponent(source.lastPathComponent)
                 try linkOrCopy(source, to: entryURL)
             }
-            let previewURL = try deployPreview(for: wallpaper, in: root)
-            return (root, renderDirectory, entryURL, previewURL)
+            return (root, renderDirectory, entryURL)
         } catch {
             try? FileManager.default.removeItem(at: root)
             throw error
         }
     }
 
+    private nonisolated static func deployedProperties(_ properties: [String: AnyCodableValue],
+                                                        in root: URL, publishedRoot: URL) throws -> [String: AnyCodableValue] {
+        var result = properties
+        for (key, value) in properties {
+            guard case .object(var descriptor) = value,
+                  case .string(let type) = descriptor["type"] else { continue }
+            let field: String
+            switch type {
+            case "scenetexture": field = "value"
+            case "usershortcut": field = "icon"
+            default: continue
+            }
+            guard case .string(let path) = descriptor[field] else { continue }
+            let deployed = try deployPropertyAsset(path, key: key, in: root)
+            let published = deployed.hasPrefix(root.path + "/")
+                ? publishedRoot.path + deployed.dropFirst(root.path.count) : deployed
+            descriptor[field] = .string(published)
+            result[key] = .object(descriptor)
+        }
+        return result
+    }
+
     private nonisolated static func deployPropertyAsset(_ path: String, key: String, in root: URL) throws -> String {
         guard !path.isEmpty, (path as NSString).isAbsolutePath else { return path }
         let source = URL(fileURLWithPath: path).resolvingSymlinksInPath()
-        guard FileManager.default.fileExists(atPath: source.path) else { return path }
-        let digest = SHA256.hash(data: Data("\(key)|\(source.path)".utf8))
+        guard FileManager.default.fileExists(atPath: source.path) else {
+            if path.hasPrefix("/assets/") || path.hasPrefix("/cache/") { return path }
+            throw CocoaError(.fileReadNoSuchFile)
+        }
+        let attributes = try source.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+        let identity = "\(key)|\(source.path)|\(attributes.contentModificationDate?.timeIntervalSince1970 ?? 0)|\(attributes.fileSize ?? 0)"
+        let digest = SHA256.hash(data: Data(identity.utf8))
             .map { String(format: "%02x", $0) }.joined()
         let directory = root.appendingPathComponent("property-assets/\(digest)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let destination = directory.appendingPathComponent(source.lastPathComponent, isDirectory: source.hasDirectoryPath)
-        try FileManager.default.copyItem(at: source, to: destination)
+        if !FileManager.default.fileExists(atPath: destination.path) {
+            try FileManager.default.copyItem(at: source, to: destination)
+        }
         return destination.path
     }
 
-    private nonisolated static func deployPreview(for wallpaper: WEWallpaper, in root: URL) throws -> URL? {
-        let source = wallpaper.previewURL.resolvingSymlinksInPath()
-        guard !source.hasDirectoryPath, FileManager.default.fileExists(atPath: source.path) else { return nil }
-        let extensionName = source.pathExtension.isEmpty ? "jpg" : source.pathExtension
-        let destination = root.appendingPathComponent("preview.\(extensionName)")
-        if !FileManager.default.fileExists(atPath: destination.path) {
-            try linkOrCopy(source, to: destination)
-        }
-        return destination
+    private nonisolated static func renderedPreviewURL(displayID: UInt32, in root: URL) -> URL {
+        root.appendingPathComponent("rendered-preview-\(displayID).png")
+    }
+
+    private nonisolated static func renderedPreviewData(source url: URL) -> Data? {
+        guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true,
+              let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: 4096
+              ] as CFDictionary) else { return nil }
+        let data = NSMutableData()
+        guard let encoder = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(encoder, image, nil)
+        guard CGImageDestinationFinalize(encoder) else { return nil }
+        return data as Data
     }
 
     private nonisolated static func deployDesktopFallback(source: URL, displayID: UInt32, in container: URL, directory: URL? = nil) throws -> URL {
@@ -738,40 +1037,45 @@ final class DynamicLockScreenManager: ObservableObject {
         }
     }
 
-    private func registerExtension(forceRestart: Bool = false) {
+    private func registerExtension(forceRestart: Bool = false, forceRegistration: Bool = false,
+                                   requireAcknowledgement: Bool = false) {
         guard canUse, let container = sharedContainerURL else { return }
         let appURL = Bundle.main.bundleURL
         let extensionURL = appURL.appendingPathComponent("Contents/Extensions/MirageWallpaperExtension.appex")
         let requests = extensionRequests
         let requestID = requests.begin()
         let previousFingerprint = UserDefaults.standard.string(forKey: registeredExtensionFingerprintKey)
+        let needsAcknowledgement = requireAcknowledgement || requiresSettingsAcknowledgement
+        requiresSettingsAcknowledgement = needsAcknowledgement
         activeProbe = nil
         connectionState = .preparing
         registrationErrorMessage = nil
-        extensionQueue.async { [weak self] in
+        registrationQueue.async { [weak self] in
             guard requests.isCurrent(requestID) else { return }
             let result = Result {
                 try WallpaperExtensionController.register(
                     appURL: appURL, extensionURL: extensionURL, container: container,
                     previousFingerprint: previousFingerprint, forceRestart: forceRestart,
+                    forceRegistration: forceRegistration, requireAcknowledgement: needsAcknowledgement,
                     isCurrent: { requests.isCurrent(requestID) })
             }
             Task { @MainActor [weak self] in
                 guard let self, self.canUse, requests.isCurrent(requestID) else { return }
+                self.requiresSettingsAcknowledgement = false
                 switch result {
                 case .success(let registration):
                     self.activeProbe = (registration.probe, extensionURL, registration.fingerprint, container)
-                    if let error = registration.errorMessage {
+                    UserDefaults.standard.set(registration.fingerprint, forKey: self.registeredExtensionFingerprintKey)
+                    switch registration.outcome {
+                    case .awaitingSystemSettings:
+                        self.connectionState = .awaitingSystemSettings
+                    case .acknowledged(let report):
+                        self.applyConnectionReport(report, selection: registration.selection)
+                    case .failed(let error):
                         self.connectionState = .failed
                         self.registrationErrorMessage = L("动态锁屏恢复失败，请重试；详细原因已写入日志")
                         MirageLogService.shared.append(error, source: "wallpaper-extension")
-                        self.refreshConnectionStatus()
-                        return
                     }
-                    UserDefaults.standard.set(registration.fingerprint, forKey: self.registeredExtensionFingerprintKey)
-                    self.connectionState = registration.report.map {
-                        $0.readyDisplayIDs.isEmpty ? .connected : .ready
-                    } ?? .registered
                     self.refreshConnectionStatus()
                 case .failure(let error):
                     self.connectionState = .failed
@@ -784,9 +1088,20 @@ final class DynamicLockScreenManager: ObservableObject {
 
     func retryConnection() {
         if isEnabled {
-            restoreConfigurationAndRegister(forceRestart: true)
+            restoreConfigurationAndRegister(forceRestart: true, forceRegistration: true, requireAcknowledgement: true)
+            showSystemSettings()
         } else {
             clearConfiguration()
+        }
+    }
+
+    private func applyConnectionReport(_ report: MirageLockReport,
+                                       selection: WallpaperExtensionController.SelectionState) {
+        registrationErrorMessage = nil
+        if selection == .notSelected {
+            connectionState = .awaitingSelection
+        } else {
+            connectionState = report.readyDisplayIDs.isEmpty ? .connected : .ready
         }
     }
 
@@ -796,39 +1111,49 @@ final class DynamicLockScreenManager: ObservableObject {
             let reports = WallpaperExtensionController.liveReports(
                 probe: active.probe, extensionURL: active.url,
                 fingerprint: active.fingerprint, container: active.container)
-            let data = try? Data(contentsOf: active.container.appendingPathComponent(MirageLockBridge.configurationName))
-            let digest = data.map(MirageLockBridge.digest)
+            let selection = WallpaperExtensionController.selectionState(
+                identifier: Bundle(url: active.url)?.bundleIdentifier ?? "cn.laobamac.Mirage.WallpaperExtension")
+            let health: (report: MirageLockReport?, errorMessage: String?)
+            do {
+                let data = try Data(contentsOf: active.container.appendingPathComponent(MirageLockBridge.configurationName))
+                health = WallpaperExtensionController.connectionHealth(
+                    reports: reports, configurationDigest: MirageLockBridge.digest(data))
+            } catch {
+                health = (nil, error.localizedDescription)
+            }
             Task { @MainActor [weak self] in
                 guard let self, self.canUse, self.activeProbe?.probe.id == active.probe.id else { return }
-                if let error = reports.compactMap(\.error).first {
+                if let error = health.errorMessage {
                     self.connectionState = .failed
                     self.registrationErrorMessage = L("动态锁屏恢复失败，请重试；详细原因已写入日志")
                     MirageLogService.shared.append(error, source: "wallpaper-extension")
                 } else {
-                    let acknowledged = reports.filter { $0.settingsReady && $0.configurationDigest == digest }
-                    guard !acknowledged.isEmpty else {
-                        if reports.isEmpty, self.registrationErrorMessage == nil { self.connectionState = .registered }
+                    guard let report = health.report else {
+                        if self.registrationErrorMessage == nil { self.connectionState = .awaitingSystemSettings }
                         return
                     }
                     UserDefaults.standard.set(active.fingerprint, forKey: self.registeredExtensionFingerprintKey)
-                    self.registrationErrorMessage = nil
-                    self.connectionState = acknowledged.contains { !$0.readyDisplayIDs.isEmpty } ? .ready : .connected
+                    self.applyConnectionReport(report, selection: selection)
                 }
             }
         }
     }
 
-    private func restoreConfigurationAndRegister(forceRestart: Bool = false) {
+    private func restoreConfigurationAndRegister(forceRestart: Bool = false, forceRegistration: Bool = false,
+                                                  requireAcknowledgement: Bool = false) {
         extensionRequests.cancel()
         activeProbe = nil
         registrationErrorMessage = nil
         do {
             if try activateStoredConfiguration() {
-                registerExtension(forceRestart: forceRestart)
+                registerExtension(forceRestart: forceRestart, forceRegistration: forceRegistration,
+                                  requireAcknowledgement: requireAcknowledgement)
             } else {
+                requiresSettingsAcknowledgement = false
                 connectionState = .needsWallpaper
             }
         } catch {
+            requiresSettingsAcknowledgement = false
             connectionState = .failed
             registrationErrorMessage = L("动态锁屏配置无法读取，请检查文件访问权限或重新设置壁纸")
             MirageLogService.shared.append(error.localizedDescription, source: "wallpaper-extension")
