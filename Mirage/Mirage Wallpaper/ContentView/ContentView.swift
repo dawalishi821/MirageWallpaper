@@ -80,7 +80,7 @@ struct ContentView: View {
     @ObservedObject private var screenSaverDynamicLockScreenManager = ScreenSaverDynamicLockScreenManager.shared
     @StateObject private var steamSetupViewModel = SteamSetupViewModel()
     @State private var loadedSections: Set<MainSection>
-    @State private var pendingSceneFileExport: WEWallpaper?
+    @State private var pendingSceneFileExport: (wallpaper: WEWallpaper, options: SceneMobileExportOptions)?
     @State private var hasPresentedUI = false
 
     init(
@@ -320,21 +320,22 @@ struct ContentView: View {
             MobileDevicesView(viewModel: AppDelegate.shared.mobileDevicesViewModel)
         }
         .sheet(item: $viewModel.pendingSceneMobileExport, onDismiss: {
-            guard let wallpaper = pendingSceneFileExport else { return }
+            guard let export = pendingSceneFileExport else { return }
             pendingSceneFileExport = nil
             DispatchQueue.main.async {
-                viewModel.presentMobileMPKGSavePanel(for: wallpaper)
+                viewModel.presentMobileMPKGSavePanel(for: export.wallpaper, sceneOptions: export.options)
             }
         }) { request in
-            SceneMobileExportOptionsView(request: request) {
+            SceneMobileExportOptionsView(request: request) { options in
                 switch request.destination {
                 case .device(let device):
                     AppDelegate.shared.mobileDevicesViewModel.send(
                         wallpaper: request.wallpaper,
-                        to: device
+                        to: device,
+                        sceneOptions: options
                     ) { _ in }
                 case .file:
-                    pendingSceneFileExport = request.wallpaper
+                    pendingSceneFileExport = (request.wallpaper, options)
                 }
             }
         }
