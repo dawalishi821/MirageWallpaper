@@ -72,9 +72,16 @@
     self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, width, height)
         styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
     self.window.releasedWhenClosed = NO; self.window.ignoresMouseEvents = YES;
-    self.window.level = CGWindowLevelForKey(kCGDesktopWindowLevelKey) + 1;
-    self.window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorStationary;
+    self.window.acceptsMouseMovedEvents = NO;
+    self.window.level = CGWindowLevelForKey(kCGDesktopIconWindowLevelKey) - 1;
+    self.window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+        NSWindowCollectionBehaviorStationary | NSWindowCollectionBehaviorIgnoresCycle;
+    self.window.opaque = YES;
+    self.window.backgroundColor = NSColor.blackColor;
+    self.window.hasShadow = NO;
+    self.window.canHide = NO;
     self.window.contentView = self.engine.webView;
+    self.engine.webView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [self.window setFrameOrigin:NSScreen.mainScreen.frame.origin];
     [self.window orderFrontRegardless];
     __weak MBWebBake *weakSelf = self;
