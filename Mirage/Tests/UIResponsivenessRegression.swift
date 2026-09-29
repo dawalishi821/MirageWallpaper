@@ -145,6 +145,7 @@ private struct UIResponsivenessRegression {
             if CommandLine.arguments.contains("--playback-policy") {
                 try testPlaybackPolicyEvaluation()
                 try testPlaybackPolicyInputs()
+                try testFullscreenPlaybackPolicy()
                 try await testPlaybackPolicySynchronization()
                 print("PlaybackPolicyRegression: all checks passed")
                 return
@@ -177,6 +178,7 @@ private struct UIResponsivenessRegression {
             try await testLogs()
             try testPlaybackPolicyEvaluation()
             try testPlaybackPolicyInputs()
+            try testFullscreenPlaybackPolicy()
             try await testPlaybackPolicySynchronization()
             print("UIResponsivenessRegression: all checks passed")
         } catch {
@@ -292,6 +294,155 @@ private struct UIResponsivenessRegression {
             throw RegressionFailure(description: "An unavailable display topology released playback rules")
         }
         print("PASS: independent battery, display sleep and audio rules, per-display priorities and failed system queries")
+    }
+
+    static func testFullscreenPlaybackPolicy() throws {
+        typealias Policy = GlobalSettingsViewModel
+        let display = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let safe = CGRect(x: 0, y: 37, width: 1512, height: 945)
+        let insets = NSEdgeInsets(top: 37, left: 0, bottom: 0, right: 0)
+        for origin in [CGPoint.zero, CGPoint(x: -1512, y: -982), CGPoint(x: 1920, y: 1080)] {
+            let bounds = display.offsetBy(dx: origin.x, dy: origin.y)
+            let screenFrame = CGRect(x: origin.x, y: 1080 - bounds.maxY, width: 1512, height: 982)
+            let area = Policy.fullscreenSafeArea(display: bounds, screenFrame: screenFrame, insets: insets)
+            try require(area == safe.offsetBy(dx: origin.x, dy: origin.y),
+                        "Safe area used the wrong display origin or inverted the top inset")
+        }
+        let scaled = Policy.fullscreenSafeArea(
+            display: CGRect(x: -3024, y: -1964, width: 3024, height: 1964), screenFrame: display,
+            insets: NSEdgeInsets(top: 37, left: 5, bottom: 4, right: 3))
+        try require(scaled == CGRect(x: -3014, y: -1890, width: 3008, height: 1882),
+                    "Safe area did not convert all four insets into display coordinates")
+        for invalid in [NSEdgeInsets(), NSEdgeInsets(top: -1, left: 0, bottom: 0, right: 0),
+                        NSEdgeInsets(top: .nan, left: 0, bottom: 0, right: 0),
+                        NSEdgeInsets(top: 982, left: 0, bottom: 0, right: 0),
+                        NSEdgeInsets(top: 37, left: 1512, bottom: 0, right: 0)] {
+            try require(Policy.fullscreenSafeArea(display: display, screenFrame: display, insets: invalid) == nil,
+                        "An absent or invalid safe area created a fullscreen fallback")
+        }
+        try require(Policy.fullscreenSafeArea(display: .zero, screenFrame: display, insets: insets) == nil,
+                    "An unavailable display produced a safe area")
+        try require(Policy.fullscreenSafeArea(display: display, screenFrame: .zero, insets: insets) == nil,
+                    "An unavailable AppKit frame produced a safe area")
+
+        var inputs = Policy.PolicyInputs()
+        inputs.onFullscreen = .pause
+        inputs.selfPID = 1
+        inputs.frontPID = 2
+        inputs.frontIsRegular = true
+        inputs.regularPIDs = [1, 2, 3, 4]
+        inputs.rendererPIDs = [4]
+        inputs.wallpaperDisplays = [1001: display]
+        inputs.fullscreenSafeAreas = [1001: safe]
+        var queries = 0
+        func evaluate(_ windows: [Policy.WindowEntry], _ sample: Policy.PolicyInputs) throws -> Policy.PolicyResult {
+            var probes = Policy.PolicyProbes(
+                onBattery: { true }, otherAppPlayingAudio: { _, _ in false }, displayAsleep: { _ in false })
+            probes.windows = { queries += 1; return windows }
+            let before = queries
+            let result = try Policy.computePlaybackActions(sample, probes: probes).get()
+            try require(queries == before + 1, "Fullscreen evaluation queried windows more than once")
+            return result
+        }
+        func window(_ bounds: CGRect, pid: pid_t = 2, layer: Int = 0, alpha: Double = 1) -> Policy.WindowEntry {
+            Policy.WindowEntry(layer: layer, pid: pid, bounds: bounds, alpha: alpha)
+        }
+        for bounds in [display, safe, safe.insetBy(dx: 0.5, dy: 0.5)] {
+            for action in [GSPlayback.mute, .pause, .stop] {
+                inputs.onFullscreen = action
+                let result = try evaluate([window(bounds)], inputs)
+                try require(result.actions[1001] == action, "Fullscreen did not apply the configured action")
+                try require(result.fullscreenDiagnostics.isEmpty, "Fullscreen diagnostics ran outside developer mode")
+            }
+        }
+        inputs.onFullscreen = .pause
+        for bounds in [CGRect(x: 0, y: 37, width: 1512, height: 870),
+                       CGRect(x: 0, y: 37, width: 756, height: 945),
+                       CGRect(x: 0, y: 37, width: 1512, height: 933),
+                       CGRect(x: 100, y: 37, width: 1512, height: 945),
+                       CGRect(x: -1512, y: 0, width: 3024, height: 982)] {
+            let result = try evaluate([window(bounds)], inputs)
+            try require(result.actions[1001] == .keepRunning, "A partial or spanning window triggered fullscreen")
+        }
+        let tiled = try evaluate([window(CGRect(x: 0, y: 37, width: 756, height: 945)),
+                                  window(CGRect(x: 756, y: 37, width: 756, height: 945), pid: 3)], inputs)
+        try require(tiled.actions[1001] == .keepRunning, "Tiled windows were combined into a fullscreen window")
+        for excluded in [window(safe, pid: 1), window(safe, pid: 4), window(safe, pid: 5),
+                         window(safe, layer: 1), window(safe, layer: -1), window(safe, alpha: 0.05)] {
+            let result = try evaluate([excluded], inputs)
+            try require(result.actions[1001] == .keepRunning, "An excluded window triggered fullscreen")
+        }
+        var ordinaryDisplay = inputs
+        ordinaryDisplay.fullscreenSafeAreas = [:]
+        let noNotch = try evaluate([window(safe)], ordinaryDisplay)
+        try require(noNotch.actions[1001] == .keepRunning, "Safe area matching was enabled on an ordinary screen")
+        let uncut = try evaluate([window(display)], ordinaryDisplay)
+        try require(uncut.actions[1001] == .pause, "Ordinary fullscreen detection regressed")
+        ordinaryDisplay.wallpaperDisplays = [1001: safe]
+        let compatibility = try evaluate([window(safe)], ordinaryDisplay)
+        try require(compatibility.actions[1001] == .pause, "An adjusted active display area was inset twice")
+
+        let second = CGRect(x: -1920, y: -1080, width: 1920, height: 1080)
+        inputs.wallpaperDisplays[1002] = second
+        let secondWindow = window(second.insetBy(dx: 100, dy: 100), pid: 3)
+        for front in [pid_t(1), 2, 3, 5] {
+            inputs.frontPID = front
+            inputs.frontIsRegular = front != 5
+            let result = try evaluate([secondWindow, window(safe)], inputs)
+            try require(result.actions == [1001: .pause, 1002: .keepRunning],
+                        "Changing focus on another display released a visible fullscreen window")
+        }
+        inputs.frontPID = nil
+        let noFocus = try evaluate([window(safe)], inputs)
+        try require(noFocus.actions == [1001: .pause, 1002: .keepRunning],
+                    "Fullscreen detection depended on a frontmost application")
+        let both = try evaluate([window(safe), window(second, pid: 3)], inputs)
+        try require(both.actions == [1001: .pause, 1002: .pause], "Only one fullscreen display received its rule")
+        inputs.fullscreenSafeAreas[1002] = second.insetBy(dx: 0, dy: 37)
+        let independent = try evaluate([window(safe)], inputs)
+        try require(independent.actions[1002] == .keepRunning, "A safe area from another display triggered fullscreen")
+
+        inputs.frontPID = 3
+        inputs.frontIsRegular = true
+        inputs.onFocused = .stop
+        inputs.onFullscreen = .mute
+        let priority = try evaluate([secondWindow, window(safe)], inputs)
+        try require(priority.actions == [1001: .mute, 1002: .stop], "Fullscreen and focus priorities changed")
+        inputs.frontPID = 2
+        let sameAppPriority = try evaluate([window(safe)], inputs)
+        try require(sameAppPriority.actions[1001] == .mute, "The focus rule overrode the fullscreen rule")
+        inputs.pauseOnCoverage = true
+        let coverage = try evaluate([window(safe)], inputs)
+        try require(coverage.actions[1001] == .pause, "Fullscreen bypassed the independent coverage rule")
+        inputs.pauseOnCoverage = false
+        inputs.onBattery = .stop
+        let battery = try evaluate([window(safe)], inputs)
+        try require(battery.actions == [1001: .stop, 1002: .stop], "Fullscreen bypassed a stronger global rule")
+        inputs.onBattery = .keepRunning
+        inputs.onFocused = .keepRunning
+        inputs.onFullscreen = .pause
+        inputs.revealGraceDisplays = [1001]
+        let reveal = try evaluate([window(safe), window(second, pid: 3)], inputs)
+        try require(reveal.actions == [1001: .keepRunning, 1002: .pause], "Desktop reveal affected the wrong display")
+        inputs.revealGraceDisplays = []
+        let hidden = try evaluate([window(safe.offsetBy(dx: 10_000, dy: 0))], inputs)
+        try require(hidden.actions == [1001: .keepRunning, 1002: .keepRunning], "An off-screen window kept playback paused")
+        let exited = try evaluate([secondWindow], inputs)
+        try require(exited.actions == [1001: .keepRunning, 1002: .keepRunning], "Leaving fullscreen did not release its rule")
+        let empty = try evaluate([], inputs)
+        try require(empty.actions == exited.actions, "An exposed desktop kept the fullscreen rule active")
+        inputs.onFullscreen = .keepRunning
+        inputs.onFocused = .mute
+        let disabled = try evaluate([window(safe)], inputs)
+        try require(disabled.actions[1001] == .mute, "Disabling fullscreen suppressed the focus rule")
+
+        inputs.onFullscreen = .pause
+        inputs.diagnoseFullscreen = true
+        let diagnosed = try evaluate([window(safe)], inputs)
+        try require(diagnosed.fullscreenDiagnostics[1001]?.contains("match=2:") == true &&
+                    diagnosed.fullscreenDiagnostics[1001]?.contains("safe=0.0,37.0,1512.0,945.0") == true,
+                    "Fullscreen diagnostics omitted the matched window or safe area")
+        print("PASS: fullscreen safe areas, coordinate conversion, exclusions, per-display focus, priorities and desktop recovery")
     }
 
     static func testPlaybackPolicySynchronization() async throws {

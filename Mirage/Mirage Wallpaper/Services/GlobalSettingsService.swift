@@ -442,6 +442,7 @@ class GlobalSettingsViewModel {
     private let policyQueue = DispatchQueue(label: "com.mirage.playback-policy", qos: .utility)
     private var playbackEvaluation = PlaybackEvaluationState()
     private var lastPolicyReadFailure: PolicyReadFailure?
+    private var lastFullscreenDiagnostics: [CGDirectDisplayID: String] = [:]
 
     struct PlaybackEvaluationState {
         struct Completion {
@@ -1013,6 +1014,8 @@ class GlobalSettingsViewModel {
         /// `NSWorkspace.runningApplications` is AppKit state.
         var regularPIDs: Set<pid_t> = []
         var wallpaperDisplays: [CGDirectDisplayID: CGRect] = [:]
+        var fullscreenSafeAreas: [CGDirectDisplayID: CGRect] = [:]
+        var diagnoseFullscreen = false
     }
 
     private struct PlaybackPolicySettingsKey: Equatable {
@@ -1044,6 +1047,7 @@ class GlobalSettingsViewModel {
     struct PolicyResult {
         let actions: [CGDirectDisplayID: GSPlayback]
         let onBattery: Bool?
+        var fullscreenDiagnostics: [CGDirectDisplayID: String] = [:]
     }
 
     enum PolicyReadFailure: String, Error {
@@ -1100,6 +1104,7 @@ class GlobalSettingsViewModel {
         inputs.onBattery = settings.laptopOnBattery
         inputs.onFocused = settings.otherApplicationFocused
         inputs.onFullscreen = settings.otherApplicationFullscreen
+        inputs.diagnoseFullscreen = settings.isDeveloperModeEnabled && inputs.onFullscreen != .keepRunning
         inputs.onAudio = settings.otherApplicationPlayingAudio
         inputs.pauseOnCoverage = settings.shouldPauseWhenWindowCoverageExceeds
         inputs.coverageThreshold = CGFloat(settings.normalizedWindowCoverageThreshold / 100)
@@ -1109,6 +1114,14 @@ class GlobalSettingsViewModel {
         let needsWindowGeometry = settings.hasWindowPlaybackRules
         for info in DisplayRegistry.shared.connected where wallpaperViewModel.displayStates[info.key] != nil {
             inputs.wallpaperDisplays[info.displayID] = needsWindowGeometry ? CGDisplayBounds(info.displayID) : .zero
+        }
+        if inputs.onFullscreen != .keepRunning {
+            for screen in NSScreen.screens {
+                guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+                      let bounds = inputs.wallpaperDisplays[number.uint32Value] else { continue }
+                inputs.fullscreenSafeAreas[number.uint32Value] = Self.fullscreenSafeArea(
+                    display: bounds, screenFrame: screen.frame, insets: screen.safeAreaInsets)
+            }
         }
         let needsRendererPIDs = needsWindowGeometry ||
             settings.otherApplicationPlayingAudio != .keepRunning
@@ -1166,6 +1179,7 @@ class GlobalSettingsViewModel {
         let isDesktopFinder = inputs.frontBundleID == "com.apple.finder" &&
             !appHasVisibleWindows(windows, pid: inputs.frontPID)
         var result: [CGDirectDisplayID: GSPlayback] = [:]
+        var fullscreenDiagnostics: [CGDirectDisplayID: String] = [:]
         for (displayID, bounds) in inputs.wallpaperDisplays {
             var actions = globalActions
             if inputs.onDisplayAsleep != .keepRunning,
@@ -1176,23 +1190,31 @@ class GlobalSettingsViewModel {
                windowCoverageExceedsThreshold(windows, display: bounds, inputs: inputs) {
                 actions.append(.pause)
             }
-            if let frontPID = inputs.frontPID,
-               inputs.frontIsRegular,
-               !isSelf,
-               !isDesktopFinder,
-               !inputs.revealGraceDisplays.contains(displayID),
-               !isDesktopExposed(windows, display: bounds, inputs: inputs),
-               appHasVisibleWindow(windows, pid: frontPID, display: bounds) {
+            let revealing = inputs.revealGraceDisplays.contains(displayID)
+            let desktopExposed = needsWindows && isDesktopExposed(windows, display: bounds, inputs: inputs)
+            var fullscreen: WindowEntry?
+            if !revealing, !desktopExposed {
                 if inputs.onFullscreen != .keepRunning,
-                   appIsFullscreen(windows, pid: frontPID, display: bounds) {
+                   let window = fullscreenWindow(windows, display: bounds,
+                                                 safeArea: inputs.fullscreenSafeAreas[displayID], inputs: inputs) {
+                    fullscreen = window
                     actions.append(inputs.onFullscreen)
-                } else if inputs.onFocused != .keepRunning {
+                } else if inputs.onFocused != .keepRunning,
+                          let frontPID = inputs.frontPID, inputs.frontIsRegular,
+                          !isSelf, !isDesktopFinder,
+                          appHasVisibleWindow(windows, pid: frontPID, display: bounds) {
                     actions.append(inputs.onFocused)
                 }
             }
+            if inputs.diagnoseFullscreen {
+                fullscreenDiagnostics[displayID] = fullscreenDiagnostic(
+                    windows, display: bounds, safeArea: inputs.fullscreenSafeAreas[displayID],
+                    inputs: inputs, match: fullscreen, revealing: revealing, desktopExposed: desktopExposed)
+            }
             result[displayID] = strongestAction(actions)
         }
-        return .success(PolicyResult(actions: result, onBattery: onBattery))
+        return .success(PolicyResult(actions: result, onBattery: onBattery,
+                                     fullscreenDiagnostics: fullscreenDiagnostics))
     }
 
     /// Main-thread tail: publish the decision and retune the polling cadence.
@@ -1214,6 +1236,11 @@ class GlobalSettingsViewModel {
         }
         effectivePlaybackActions = actions
         AppDelegate.shared.wallpaperViewModel.applyPlaybackPolicies(actions, force: force)
+        for (displayID, diagnostic) in result.fullscreenDiagnostics.sorted(by: { $0.key < $1.key })
+        where diagnostic != lastFullscreenDiagnostics[displayID] {
+            MirageLogService.shared.append("display=\(displayID) \(diagnostic)", source: "playback-fullscreen")
+        }
+        lastFullscreenDiagnostics = result.fullscreenDiagnostics
         if changed || force {
             let decisions = result.actions.sorted { $0.key < $1.key }
                 .map { "\($0.key):\($0.value.rawValue)" }.joined(separator: ",")
@@ -1313,10 +1340,32 @@ class GlobalSettingsViewModel {
         return pid
     }
 
-    private static func appIsFullscreen(_ windows: [WindowEntry], pid: pid_t,
-                                        display: CGRect) -> Bool {
-        for window in windows where window.pid == pid && window.layer == 0 && window.alpha > 0.05 {
-            guard window.bounds.width >= 120, window.bounds.height >= 80 else { continue }
+    static func fullscreenSafeArea(display: CGRect, screenFrame: CGRect, insets: NSEdgeInsets) -> CGRect? {
+        let dimensions = [display.width, display.height, screenFrame.width, screenFrame.height]
+        let margins = [insets.top, insets.left, insets.bottom, insets.right]
+        guard dimensions.allSatisfy({ $0.isFinite && $0 > 0 }),
+              display.minX.isFinite, display.minY.isFinite,
+              margins.allSatisfy({ $0.isFinite && $0 >= 0 }), margins.contains(where: { $0 > 0 }),
+              insets.left + insets.right < screenFrame.width,
+              insets.top + insets.bottom < screenFrame.height else { return nil }
+        let scaleX = display.width / screenFrame.width
+        let scaleY = display.height / screenFrame.height
+        return CGRect(x: display.minX + insets.left * scaleX,
+                      y: display.minY + insets.top * scaleY,
+                      width: display.width - (insets.left + insets.right) * scaleX,
+                      height: display.height - (insets.top + insets.bottom) * scaleY)
+    }
+
+    private static func isFullscreenCandidate(_ window: WindowEntry, inputs: PolicyInputs) -> Bool {
+        window.layer == 0 && window.alpha > 0.05 &&
+            window.pid != inputs.selfPID && !inputs.rendererPIDs.contains(window.pid) &&
+            inputs.regularPIDs.contains(window.pid) &&
+            window.bounds.width >= 120 && window.bounds.height >= 80
+    }
+
+    private static func fullscreenWindow(_ windows: [WindowEntry], display: CGRect,
+                                         safeArea: CGRect?, inputs: PolicyInputs) -> WindowEntry? {
+        for window in windows where isFullscreenCandidate(window, inputs: inputs) {
             let intersection = window.bounds.intersection(display)
             guard !intersection.isNull else { continue }
             let displayArea = display.width * display.height
@@ -1329,10 +1378,33 @@ class GlobalSettingsViewModel {
                 abs(window.bounds.maxY - display.maxY) <= tolerance
             if edgesMatch || (intersectionArea / max(displayArea, 1) >= 0.985 &&
                               intersectionArea / max(windowArea, 1) >= 0.90) {
-                return true
+                return window
+            }
+            if let safeArea, safeArea.width > 0, safeArea.height > 0, display.contains(safeArea),
+               abs(window.bounds.minX - safeArea.minX) <= 1,
+               abs(window.bounds.minY - safeArea.minY) <= 1,
+               abs(window.bounds.maxX - safeArea.maxX) <= 1,
+               abs(window.bounds.maxY - safeArea.maxY) <= 1 {
+                return window
             }
         }
-        return false
+        return nil
+    }
+
+    private static func fullscreenDiagnostic(_ windows: [WindowEntry], display: CGRect, safeArea: CGRect?,
+                                             inputs: PolicyInputs, match: WindowEntry?, revealing: Bool,
+                                             desktopExposed: Bool) -> String {
+        func rectangle(_ bounds: CGRect) -> String {
+            "\(bounds.minX),\(bounds.minY),\(bounds.width),\(bounds.height)"
+        }
+        let candidates = windows.lazy.filter {
+            $0.bounds.width >= 120 && $0.bounds.height >= 80 && !$0.bounds.intersection(display).isNull
+        }.prefix(6).map {
+            "pid=\($0.pid),layer=\($0.layer),alpha=\($0.alpha),eligible=\(isFullscreenCandidate($0, inputs: inputs)),bounds=\(rectangle($0.bounds))"
+        }.joined(separator: ";")
+        let safe = safeArea.map(rectangle) ?? "none"
+        let matched = match.map { "\($0.pid):\(rectangle($0.bounds))" } ?? "none"
+        return "bounds=\(rectangle(display)) safe=\(safe) front=\(inputs.frontPID ?? 0) reveal=\(revealing) exposed=\(desktopExposed) match=\(matched) windows=[\(candidates)]"
     }
 
     private static func appHasVisibleWindows(_ windows: [WindowEntry], pid: pid_t?) -> Bool {
