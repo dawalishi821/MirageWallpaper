@@ -8,7 +8,6 @@
 import AppKit
 import AVFoundation
 import Combine
-import CryptoKit
 import Foundation
 import Darwin
 
@@ -97,7 +96,7 @@ final class WallpaperBakeService: ObservableObject {
         let wallpaper: WEWallpaper
         let settings: WallpaperBakeSettings
         var state = "queued"
-        var progress = 0.0
+        var progress: WallpaperBakeProgress?
         var error: String?
         var output: URL?
         var log: URL?
@@ -165,8 +164,10 @@ final class WallpaperBakeService: ObservableObject {
                             MainActor.assumeIsolated {
                                 guard let index = self.jobs.firstIndex(where: { $0.id == request.id }) else { return }
                                 guard !self.jobs[index].finished else { return }
-                                if !self.jobs[index].cancellation.isCancelled { self.jobs[index].state = event }
-                                self.jobs[index].progress = max(self.jobs[index].progress, progress)
+                                if !self.jobs[index].cancellation.isCancelled {
+                                    self.jobs[index].state = event
+                                    self.jobs[index].progress = progress
+                                }
                                 if let log { self.jobs[index].log = log }
                             }
                         }
@@ -178,7 +179,9 @@ final class WallpaperBakeService: ObservableObject {
                 jobs[index].finished = true
                 switch result {
                 case .success(let url):
-                    jobs[index].state = "complete"; jobs[index].progress = 1; jobs[index].output = url
+                    jobs[index].state = "complete"
+                    jobs[index].progress = WallpaperBakeProgress(completed: 1, total: 1)
+                    jobs[index].output = url
                     AppDelegate.shared.contentViewModel.refresh()
                 case .failure(let error):
                     jobs[index].state = request.cancellation.isCancelled ? "cancelled" : "failed"
@@ -190,7 +193,7 @@ final class WallpaperBakeService: ObservableObject {
         }
     }
 
-    nonisolated private static func run(_ job: Request, update: @escaping (String, Double, URL?) -> Void) throws -> URL {
+    nonisolated private static func run(_ job: Request, update: @escaping (String, WallpaperBakeProgress?, URL?) -> Void) throws -> URL {
         let fm = FileManager.default
         let stage = job.destination.appendingPathComponent(".mirage-bake-\(job.id.uuidString)", isDirectory: true)
         let logRoot = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appending(path: "Mirage/Baking/Logs")
@@ -199,7 +202,7 @@ final class WallpaperBakeService: ObservableObject {
         try fm.createDirectory(at: logRoot, withIntermediateDirectories: true)
         let logURL = logRoot.appendingPathComponent("\(job.id.uuidString).log")
         fm.createFile(atPath: logURL.path, contents: nil)
-        update("checking", 0, logURL)
+        update("checking", nil, logURL)
         let available = try job.destination.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage ?? 0
         guard available > job.settings.estimatedBytes * 2 + 512 * 1024 * 1024 else { throw WallpaperBakeError.code("disk_space") }
         try job.cancellation.check()
@@ -208,7 +211,8 @@ final class WallpaperBakeService: ObservableObject {
         }
         let source = job.wallpaper.resolvedEntryURL
         let roots = [job.wallpaper.renderDirectory] + job.wallpaper.assetOverlayDirectories
-        let before = try digest(roots, cancellation: job.cancellation)
+        let before = try WallpaperBakeIO.digest(roots, check: job.cancellation.check) { update("checking", $0, nil) }
+        update("preparing", nil, nil)
         let projectRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let resources = Bundle.main.resourceURL ?? projectRoot
         let name: String
@@ -269,47 +273,46 @@ final class WallpaperBakeService: ObservableObject {
         let activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .idleSystemSleepDisabled], reason: "Mirage wallpaper baking")
         defer { ProcessInfo.processInfo.endActivity(activity) }
         try job.cancellation.launch(process)
-        defer { job.cancellation.clearProcess() }
+        defer {
+            if process.isRunning {
+                process.terminate()
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3) {
+                    if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+                }
+                process.waitUntilExit()
+            }
+            job.cancellation.clearProcess()
+        }
         try? pipe.fileHandleForWriting.close()
         defer { try? pipe.fileHandleForReading.close() }
-        var buffer = Data(), complete = false, failure: String?
-        while true {
-            let data = try pipe.fileHandleForReading.read(upToCount: 8192) ?? Data()
-            if data.isEmpty { break }
-            buffer.append(data)
-            if buffer.count > 1_048_576 { job.cancellation.cancel(); throw WallpaperBakeError.code("render_failed") }
-            while let newline = buffer.firstIndex(of: 10) {
-                let line = buffer.prefix(upTo: newline); buffer.removeSubrange(...newline)
-                try log.write(contentsOf: line + Data([10]))
-                guard let event = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any], let state = event["event"] as? String else { continue }
-                if state == "complete" { complete = true }
-                if state == "error" { failure = event["code"] as? String ?? "render_failed" }
-                let current = event["completed"] as? Double ?? 0, total = event["total"] as? Double ?? 1
-                let fraction = min(1, max(0, current / max(1, total)))
-                let progress: Double
-                switch state {
-                case "warming", "progress" where job.wallpaper.kind == .scene:
-                    let warmupFrames = Double(job.settings.warmup * job.settings.fps)
-                    let outputFrames = Double(job.settings.duration * job.settings.fps)
-                    let done = state == "warming" ? current : warmupFrames + current
-                    progress = min(0.97, done / max(1, warmupFrames + outputFrames) * 0.97)
-                case "progress": progress = fraction * 0.97
-                default: progress = 0
-                }
-                update(state, progress, nil)
+        var complete = false, failure: String?
+        try WallpaperBakeIO.readLines(from: pipe.fileHandleForReading, check: job.cancellation.check) { line in
+            try log.write(contentsOf: line + Data([10]))
+            guard let event = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
+                  let state = event["event"] as? String else { return }
+            if state == "complete" {
+                complete = true
+                update("finalizing", nil, nil)
+                return
             }
+            if state == "error" { failure = event["code"] as? String ?? "render_failed"; return }
+            guard !complete, failure == nil,
+                  ["preparing", "transcoding", "warming", "progress", "finishing", "muxing", "verifying"].contains(state) else { return }
+            update(state, WallpaperBakeProgress(event: event), nil)
         }
         process.waitUntilExit()
         try job.cancellation.check()
         guard process.terminationStatus == 0, complete, failure == nil else { throw WallpaperBakeError.code(failure ?? "render_failed") }
-        update("verifying", 0.98, nil)
-        guard before == (try digest(roots, cancellation: job.cancellation)) else { throw WallpaperBakeError.code("source_changed") }
+        let after = try WallpaperBakeIO.digest(roots, check: job.cancellation.check) { update("rechecking", $0, nil) }
+        guard before == after else { throw WallpaperBakeError.code("source_changed") }
+        update("preview", nil, nil)
         let generator = AVAssetImageGenerator(asset: AVURLAsset(url: output))
         generator.appliesPreferredTrackTransform = true
         let image = try generator.copyCGImage(at: .zero, actualTime: nil)
         guard let preview = NSBitmapImageRep(cgImage: image).representation(using: .jpeg,
             properties: [.compressionFactor: 0.85]) else { throw WallpaperBakeError.code("decode_failed") }
         try preview.write(to: stage.appending(path: "preview.jpg"), options: .atomic)
+        update("finalizing", nil, nil)
         var project = WEProject(author: job.wallpaper.project.resolvedAuthor, contentrating: job.wallpaper.project.contentrating,
             file: "wallpaper.mp4", preview: "preview.jpg", tags: job.wallpaper.project.tags,
             title: job.title, type: "video")
@@ -320,7 +323,7 @@ final class WallpaperBakeService: ObservableObject {
         try encoder.encode(project).write(to: stage.appending(path: "project.json"), options: .atomic)
         var receipt = request
         receipt.removeValue(forKey: "output"); receipt.removeValue(forKey: "cache")
-        receipt["sourceDigest"] = before; receipt["rendererDigest"] = try digest([binary], cancellation: job.cancellation)
+        receipt["sourceDigest"] = before; receipt["rendererDigest"] = try WallpaperBakeIO.digest([binary], check: job.cancellation.check)
         try JSONSerialization.data(withJSONObject: receipt, options: [.prettyPrinted, .sortedKeys]).write(to: stage.appending(path: "bake.json"), options: .atomic)
         try? fm.removeItem(at: cache); try? fm.removeItem(at: requestURL)
         try? fm.removeItem(at: stage.appending(path: "decoded.mp4"))
@@ -330,27 +333,4 @@ final class WallpaperBakeService: ObservableObject {
         return destination
     }
 
-    nonisolated private static func digest(_ roots: [URL], cancellation: WallpaperBakeCancellation) throws -> String {
-        var hash = SHA256()
-        for root in roots {
-            let isDirectory = (try root.resourceValues(forKeys: [.isDirectoryKey])).isDirectory == true
-            let files: [URL]
-            if isDirectory {
-                guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey],
-                    options: [.skipsHiddenFiles]) else { throw WallpaperBakeError.code("invalid_source") }
-                files = enumerator.compactMap { $0 as? URL }.sorted { $0.path < $1.path }
-            } else { files = [root] }
-            for file in files {
-                try cancellation.check()
-                guard (try file.resourceValues(forKeys: [.isRegularFileKey])).isRegularFile == true else { continue }
-                hash.update(data: Data(file.path.utf8)); hash.update(data: Data([0]))
-                let handle = try FileHandle(forReadingFrom: file)
-                defer { try? handle.close() }
-                while let data = try handle.read(upToCount: 1_048_576), !data.isEmpty {
-                    try cancellation.check(); hash.update(data: data)
-                }
-            }
-        }
-        return hash.finalize().map { String(format: "%02x", $0) }.joined()
-    }
 }

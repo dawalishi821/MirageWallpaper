@@ -95,7 +95,7 @@ struct WallpaperBakeView: View {
             Text("烘焙会固定当前属性，生成新的 SDR 视频壁纸。鼠标交互、时钟和实时媒体信息不会继续更新；首尾不保证无缝。")
                 .font(.callout).foregroundStyle(.secondary)
             if wallpaper.kind == .web {
-                Text("网页将以原速实时录制，输出静音。录制期间会显示独立的桌面层窗口。")
+                Text("网页将以原速在后台实时录制，输出静音，不改变当前桌面壁纸。")
                     .font(.callout).foregroundStyle(.secondary)
                 if !WallpaperViewModel.isWallpaperTrusted(wallpaper) {
                     Toggle("我信任此网页壁纸并允许运行其脚本", isOn: $trusted)
@@ -214,8 +214,8 @@ struct WallpaperBakeTasksView: View {
                         .font(.subheadline.weight(.semibold))
                         .lineLimit(1)
                     Spacer(minLength: 4)
-                    if job.state == "complete" || (!job.finished && job.progress > 0) {
-                        Text("\(Int((job.progress * 100).rounded()))%")
+                    if let fraction = job.progress?.fraction, job.state == "complete" || !job.finished {
+                        Text(job.state == "complete" ? "100%" : L("本阶段 %d%%", Int((fraction * 100).rounded(.down))))
                             .font(.subheadline.weight(.semibold))
                             .monospacedDigit()
                             .foregroundStyle(job.state == "complete" ? .green : .primary)
@@ -224,8 +224,11 @@ struct WallpaperBakeTasksView: View {
                 }
 
                 HStack(spacing: 6) {
-                    Image(systemName: statusIcon(job.state))
-                        .font(.caption)
+                    if !job.finished && job.state != "queued" && job.progress?.fraction == nil {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Image(systemName: statusIcon(job.state)).font(.caption)
+                    }
                     Text(status(job.state))
                         .font(.caption)
                 }
@@ -237,10 +240,14 @@ struct WallpaperBakeTasksView: View {
                             .fill(Color.primary.opacity(0.1))
                         RoundedRectangle(cornerRadius: 2)
                             .fill(statusColor(job.state))
-                            .frame(width: geometry.size.width * min(1, max(0, job.progress)))
+                            .frame(width: geometry.size.width * (job.progress?.fraction ?? 0))
                     }
                 }
                 .frame(height: 4)
+
+                if !job.finished, let detail = progressDetail(job.progress) {
+                    Text(detail).font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                }
 
                 if let error = job.error {
                     Text(error)
@@ -281,6 +288,24 @@ struct WallpaperBakeTasksView: View {
         .padding(.vertical, 16)
     }
 
+    private func progressDetail(_ progress: WallpaperBakeProgress?) -> String? {
+        guard let progress else { return nil }
+        switch progress.unit {
+        case "bytes":
+            let completed = ByteCountFormatter.string(fromByteCount: Int64(min(progress.completed, Double(Int64.max / 2))), countStyle: .file)
+            guard let total = progress.total else { return completed }
+            return L("已检查 %@ / %@", completed,
+                ByteCountFormatter.string(fromByteCount: Int64(min(total, Double(Int64.max / 2))), countStyle: .file))
+        case "frames":
+            guard let total = progress.total else { return nil }
+            return L("已处理 %@ / %@ 帧", progress.completed.formatted(.number.precision(.fractionLength(0))),
+                total.formatted(.number.precision(.fractionLength(0))))
+        case "files":
+            return L("已发现 %@ 个项目", progress.completed.formatted(.number.precision(.fractionLength(0))))
+        default: return nil
+        }
+    }
+
     private func statusIcon(_ state: String) -> String {
         switch state {
         case "complete": return "checkmark.circle.fill"
@@ -305,6 +330,12 @@ struct WallpaperBakeTasksView: View {
         case "queued": return L("等待烘焙")
         case "checking": return L("检查源文件")
         case "preparing": return L("准备烘焙")
+        case "transcoding": return L("转换源视频")
+        case "finishing": return L("完成视频编码")
+        case "muxing": return L("合并音视频")
+        case "rechecking": return L("复查源文件")
+        case "preview": return L("生成烘焙封面")
+        case "finalizing": return L("整理烘焙结果")
         case "warming": return L("预热场景")
         case "progress": return L("正在烘焙")
         case "verifying": return L("验证烘焙结果")

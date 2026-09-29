@@ -51,11 +51,15 @@ BOOL MBVerify(NSString *path, NSInteger width, NSInteger height, double duration
         std::abs(CMTimeGetSeconds(asset.duration) - duration) > 0.12 ||
         std::abs(track.naturalSize.width - width) > 1 || std::abs(track.naturalSize.height - height) > 1) return NO;
     AVAssetImageGenerator *generator = [AVAssetImageGenerator assetImageGeneratorWithAsset:asset];
+    NSInteger verified = 0;
+    MBEvent(@"verifying", @{@"completed":@0, @"total":@3});
     for (NSNumber *fraction in @[@0.0, @0.5, @0.95]) {
+        if (MBCancelled()) return NO;
         CGImageRef image = [generator copyCGImageAtTime:CMTimeMakeWithSeconds(duration * fraction.doubleValue, 60000)
                                            actualTime:nil error:nil];
         if (!image) return NO;
         CGImageRelease(image);
+        MBEvent(@"verifying", @{@"completed":@(++verified), @"total":@3});
     }
     return YES;
 }
@@ -188,9 +192,11 @@ BOOL MBVerify(NSString *path, NSInteger width, NSInteger height, double duration
     exporter.outputFileType = AVFileTypeMPEG4;
     exporter.timeRange = range;
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    MBEvent(@"muxing", @{@"completed":@0, @"total":@1});
     [exporter exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(done); }];
     double deadline = NSProcessInfo.processInfo.systemUptime + 90;
     while (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC))) {
+        MBEvent(@"muxing", @{@"completed":@(exporter.progress), @"total":@1});
         if (MBCancelled() || NSProcessInfo.processInfo.systemUptime > deadline) { [exporter cancelExport]; return NO; }
     }
     if (exporter.status != AVAssetExportSessionStatusCompleted) return NO;
@@ -201,6 +207,7 @@ BOOL MBVerify(NSString *path, NSInteger width, NSInteger height, double duration
 }
 - (BOOL)finish {
     if (_nextFrame != llround(_duration * _fps) || MBCancelled()) { [self cancel]; return NO; }
+    MBEvent(@"finishing", @{});
     [_writer endSessionAtSourceTime:CMTimeMake(_nextFrame, (int32_t)_fps)];
     [_video markAsFinished];
     if (_audio) {
@@ -222,8 +229,8 @@ int MBWriteAudio(void *writer, const float *samples, uint32_t count, int64_t off
     @autoreleasepool { return [(__bridge MBBakeWriter *)writer appendAudio:samples frames:count at:offset]; }
 }
 void MBProgress(uint32_t frame, uint32_t count) {
-    @autoreleasepool { MBEvent(@"progress", @{@"completed":@(frame), @"total":@(count)}); }
+    @autoreleasepool { MBEvent(@"progress", @{@"completed":@(frame), @"total":@(count), @"unit":@"frames"}); }
 }
 void MBWarmup(uint32_t frame, uint32_t count) {
-    @autoreleasepool { MBEvent(@"warming", @{@"completed":@(frame), @"total":@(count)}); }
+    @autoreleasepool { MBEvent(@"warming", @{@"completed":@(frame), @"total":@(count), @"unit":@"frames"}); }
 }

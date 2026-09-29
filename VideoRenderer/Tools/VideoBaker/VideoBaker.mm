@@ -19,10 +19,14 @@ int main(int argc, const char **argv) {
         if (![VRTranscoder fileIsDecodable:source]) {
             NSURL *converted = [[NSURL fileURLWithPath:r[@"output"]] URLByDeletingLastPathComponent];
             converted = [converted URLByAppendingPathComponent:@"decoded.mp4"];
-            if (![VRTranscoder transcodeFileAtURL:source toURL:converted progress:nil error:nil] || MBCancelled()) {
+            MBEvent(@"transcoding", @{});
+            if (![VRTranscoder transcodeFileAtURL:source toURL:converted progress:^(double fraction) {
+                MBEvent(@"transcoding", @{@"completed":@(fraction), @"total":@1});
+            } error:nil] || MBCancelled()) {
                 MBEvent(@"error", @{@"code":@"decode_failed"}); return 1;
             }
             source = converted;
+            MBEvent(@"preparing", @{});
         }
         AVURLAsset *asset = [AVURLAsset URLAssetWithURL:source options:nil];
         AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
@@ -101,9 +105,10 @@ int main(int argc, const char **argv) {
             AVMutableAudioMix *mix = [AVMutableAudioMix audioMix]; mix.inputParameters = @[parameters]; exporter.audioMix = mix;
         }
         dispatch_semaphore_t done = dispatch_semaphore_create(0);
+        MBEvent(@"progress", @{@"completed":@0, @"total":@1});
         [exporter exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(done); }];
         double lastProgress = -1, lastChange = NSProcessInfo.processInfo.systemUptime;
-        while (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC))) {
+        while (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 4))) {
             double progress = exporter.progress;
             if (progress > lastProgress) { lastProgress = progress; lastChange = NSProcessInfo.processInfo.systemUptime; }
             MBEvent(@"progress", @{@"completed":@(progress * 1000), @"total":@1000});
