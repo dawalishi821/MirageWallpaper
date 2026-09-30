@@ -331,9 +331,14 @@ enum WEHTML {
             let closing = Array("</\(name)".utf8)
             while index < bytes.count {
                 if bytes[index] == 60, index + closing.count < bytes.count {
-                    let candidate = bytes[index..<(index + closing.count)]
-                    let matches = zip(candidate, closing).allSatisfy { actual, expected in
-                        (65...90).contains(actual) ? actual + 32 == expected : actual == expected
+                    var matches = true
+                    for offset in closing.indices {
+                        let actual = bytes[index + offset]
+                        let lowercase: UInt8 = actual >= 65 && actual <= 90 ? actual + 32 : actual
+                        if lowercase != closing[offset] {
+                            matches = false
+                            break
+                        }
                     }
                     let next = bytes[index + closing.count]
                     if matches && (isSpace(next) || next == 47 || next == 62) {
