@@ -30,57 +30,108 @@ enum WEHTML {
                        options: [.regularExpression, .caseInsensitive]) != nil
     }
 
-    @MainActor private static var pendingImports: [String: Task<AttributedString?, Never>] = [:]
-    @MainActor private static var importSlots: [Task<AttributedString?, Never>?] = [nil, nil]
-    @MainActor private static var nextImportSlot = 0
+    @MainActor private static let imports = ImportQueue()
 
     @MainActor
     static func attributed(_ raw: String) async -> AttributedString? {
-        let key = raw as NSString
-        if let cached = attributedCache.object(forKey: key) { return cached.value }
-        if let pending = pendingImports[raw] { return await pending.value }
-        let slot = nextImportSlot
-        nextImportSlot = (slot + 1) % importSlots.count
-        let previous = importSlots[slot]
-        let task = Task { @MainActor () -> AttributedString? in
-            _ = await previous?.value
-            let parsed: NSAttributedString? = await withCheckedContinuation { continuation in
+        await imports.value(for: raw)
+    }
+
+    @MainActor
+    final class ImportQueue {
+        private final class Request {
+            let html: String
+            var consumers: [UUID: CheckedContinuation<AttributedString?, Never>] = [:]
+            var active = false
+
+            init(_ html: String) { self.html = html }
+        }
+
+        private let importer: (String) async -> NSAttributedString?
+        private let cache = NSCache<NSString, Box>()
+        private var requests: [String: Request] = [:]
+        private var waiting: [Request] = []
+        private var activeCount = 0
+
+        init(importer: @escaping (String) async -> NSAttributedString? = { raw in
+            await withCheckedContinuation { continuation in
                 NSAttributedString.loadFromHTML(string: normalizeAngles(raw), options: [.timeout: 2.0]) {
                     value, _, _ in continuation.resume(returning: value)
                 }
             }
-            guard let parsed else { return nil }
-            var result = AttributedString(parsed)
-            for run in result.runs {
-                result[run.range].foregroundColor = nil
-                result[run.range].backgroundColor = nil
-                result[run.range].font = nil
-            }
-            while let last = result.characters.last, last.isNewline || last == " " {
-                result.removeSubrange(result.index(beforeCharacter: result.endIndex)..<result.endIndex)
-            }
-            attributedCache.setObject(Box(result), forKey: key)
-            return result
+        }) {
+            self.importer = importer
+            cache.countLimit = 256
         }
-        pendingImports[raw] = task
-        importSlots[slot] = task
-        let result = await task.value
-        pendingImports[raw] = nil
-        return result
+
+        func value(for raw: String) async -> AttributedString? {
+            guard !Task.isCancelled else { return nil }
+            if let cached = cache.object(forKey: raw as NSString) { return cached.value }
+            let token = UUID()
+            return await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    guard !Task.isCancelled else { continuation.resume(returning: nil); return }
+                    let request: Request
+                    if let existing = requests[raw] {
+                        request = existing
+                    } else {
+                        request = Request(raw)
+                        requests[raw] = request
+                        waiting.append(request)
+                    }
+                    request.consumers[token] = continuation
+                    startWaiting()
+                }
+            } onCancel: {
+                Task { @MainActor [weak self] in self?.cancel(raw, token: token) }
+            }
+        }
+
+        private func cancel(_ raw: String, token: UUID) {
+            guard let request = requests[raw] else { return }
+            request.consumers.removeValue(forKey: token)?.resume(returning: nil)
+            if request.consumers.isEmpty && !request.active {
+                requests[raw] = nil
+                waiting.removeAll { $0 === request }
+            }
+        }
+
+        private func startWaiting() {
+            while activeCount < 2, !waiting.isEmpty {
+                let request = waiting.removeFirst()
+                request.active = true
+                activeCount += 1
+                Task { @MainActor in
+                    let parsed = await importer(request.html)
+                    var result: AttributedString?
+                    if !request.consumers.isEmpty, let parsed {
+                        var value = AttributedString(parsed)
+                        for run in value.runs {
+                            value[run.range].foregroundColor = nil
+                            value[run.range].backgroundColor = nil
+                            value[run.range].font = nil
+                        }
+                        while let last = value.characters.last, last.isNewline || last == " " {
+                            value.removeSubrange(value.index(beforeCharacter: value.endIndex)..<value.endIndex)
+                        }
+                        cache.setObject(Box(value), forKey: request.html as NSString)
+                        result = value
+                    }
+                    requests[request.html] = nil
+                    activeCount -= 1
+                    let consumers = request.consumers.values
+                    request.consumers.removeAll()
+                    consumers.forEach { $0.resume(returning: result) }
+                    startWaiting()
+                }
+            }
+        }
     }
 
     private final class Box {
         let value: AttributedString
         init(_ value: AttributedString) { self.value = value }
     }
-
-    // Parsing HTML is not cheap and SwiftUI re-evaluates bodies freely, so the
-    // result is memoised per source string.
-    private static let attributedCache: NSCache<NSString, Box> = {
-        let cache = NSCache<NSString, Box>()
-        cache.countLimit = 256
-        return cache
-    }()
 
     private static func normalizeAngles(_ raw: String) -> String {
         raw.replacingOccurrences(of: "＜", with: "<")
@@ -213,6 +264,8 @@ private struct RichHTMLWebView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
+        config.userContentController.add(context.coordinator,
+            contentWorld: .defaultClient, name: "mirageLabelSize")
         let webView = PassThroughWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")
@@ -221,12 +274,77 @@ private struct RichHTMLWebView: NSViewRepresentable {
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
+        context.coordinator.parent = self
         guard context.coordinator.loadedHTML != html else { return }
         context.coordinator.loadedHTML = html
+        let generation = UUID().uuidString
+        context.coordinator.generation = generation
+        context.coordinator.publish(height: 24, generation: generation)
+        let controller = webView.configuration.userContentController
+        controller.removeAllUserScripts()
+        controller.addUserScript(WKUserScript(source: Self.measurementScript(generation: generation),
+            injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: .defaultClient))
         webView.loadHTMLString(Self.wrap(html), baseURL: nil)
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    static func dismantleNSView(_ webView: WKWebView, coordinator: Coordinator) {
+        coordinator.generation = nil
+        coordinator.publication?.cancel()
+        coordinator.publication = nil
+        webView.evaluateJavaScript("window.__mirageLabelCleanup?.()", in: nil,
+                                  in: .defaultClient, completionHandler: nil)
+        webView.stopLoading()
+        webView.navigationDelegate = nil
+        webView.configuration.userContentController.removeScriptMessageHandler(
+            forName: "mirageLabelSize", contentWorld: .defaultClient)
+        webView.configuration.userContentController.removeAllUserScripts()
+    }
+
+    private static func measurementScript(generation: String) -> String {
+        """
+        (() => {
+            const content = document.getElementById('mirage-label-content');
+            if (!content) return;
+            let scheduled = false;
+            let disposed = false;
+            let previous = -1;
+            const measure = () => {
+                if (disposed || scheduled) return;
+                scheduled = true;
+                Promise.resolve().then(() => {
+                    scheduled = false;
+                    if (disposed) return;
+                    const height = Math.max(1, Math.ceil(Math.max(
+                        content.getBoundingClientRect().height, content.scrollHeight)));
+                    if (height === previous) return;
+                    previous = height;
+                    window.webkit.messageHandlers.mirageLabelSize.postMessage({
+                        generation: '\(generation)', height
+                    });
+                });
+            };
+            const resize = new ResizeObserver(measure);
+            const mutation = new MutationObserver(measure);
+            resize.observe(content);
+            mutation.observe(content, {
+                subtree: true, childList: true, attributes: true, characterData: true
+            });
+            document.addEventListener('load', measure, true);
+            window.addEventListener('resize', measure);
+            window.__mirageLabelCleanup = () => {
+                disposed = true;
+                resize.disconnect();
+                mutation.disconnect();
+                document.removeEventListener('load', measure, true);
+                window.removeEventListener('resize', measure);
+            };
+            if (document.fonts) document.fonts.ready.then(measure);
+            measure();
+        })();
+        """
+    }
 
     private static func wrap(_ body: String) -> String {
         let normalized = body
@@ -238,6 +356,7 @@ private struct RichHTMLWebView: NSViewRepresentable {
         <style>
         :root { color-scheme: light dark; }
         html, body { margin:0; padding:0; background:transparent; }
+        #mirage-label-content { display: flow-root; width: 100%; }
         /* Property labels are display-only: retain link clicks while disabling
            WebKit's default text selection and drag sources. */
         html, body, body * {
@@ -262,35 +381,37 @@ private struct RichHTMLWebView: NSViewRepresentable {
         center { text-align: center; }
         p { margin: 4px 0; }
         table { max-width: 100%; }
-        </style></head><body>\(normalized)</body></html>
+        </style></head><body><div id="mirage-label-content">\(normalized)</div></body></html>
         """
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate {
-        let parent: RichHTMLWebView
+    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+        var parent: RichHTMLWebView
         var loadedHTML: String?
+        var generation: String?
+        var publication: DispatchWorkItem?
         init(_ parent: RichHTMLWebView) { self.parent = parent }
 
-        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            measure(webView)
-            // Remote images change height after decode; re-measure once.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak webView] in
-                guard let webView else { return }
-                self.measure(webView)
-            }
+        func userContentController(_ userContentController: WKUserContentController,
+                                   didReceive message: WKScriptMessage) {
+            guard message.frameInfo.isMainFrame,
+                  let payload = message.body as? [String: Any],
+                  let generation = payload["generation"] as? String,
+                  let height = payload["height"] as? Double,
+                  height.isFinite, height > 0 else { return }
+            publish(height: CGFloat(height), generation: generation)
         }
 
-        private func measure(_ webView: WKWebView) {
-            let js = "Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)"
-            webView.evaluateJavaScript(js) { result, _ in
-                let h: CGFloat?
-                if let v = result as? CGFloat { h = v }
-                else if let n = result as? NSNumber { h = CGFloat(truncating: n) }
-                else { h = nil }
-                if let h, h > 0, abs(h - self.parent.height) > 0.5 {
-                    DispatchQueue.main.async { self.parent.height = h }
-                }
+        func publish(height: CGFloat, generation: String) {
+            guard self.generation == generation else { return }
+            publication?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.generation == generation else { return }
+                self.publication = nil
+                if abs(height - self.parent.height) > 0.5 { self.parent.height = height }
             }
+            publication = work
+            DispatchQueue.main.async(execute: work)
         }
 
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
