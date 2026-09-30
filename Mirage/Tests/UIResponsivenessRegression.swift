@@ -5,7 +5,9 @@
 //
 
 import AppKit
+import AVFoundation
 import Combine
+import CoreAudio
 import ImageIO
 import Observation
 import UniformTypeIdentifiers
@@ -19,10 +21,77 @@ private final class Locked<Value>: @unchecked Sendable {
     private let lock = NSLock()
     private var value: Value
     init(_ value: Value) { self.value = value }
-    func access<T>(_ body: (inout Value) -> T) -> T {
+    func access<T>(_ body: (inout Value) throws -> T) rethrows -> T {
         lock.lock()
         defer { lock.unlock() }
-        return body(&value)
+        return try body(&value)
+    }
+}
+
+private final class PlaybackAudioHardwareProbe {
+    typealias Monitor = PlaybackAudioMonitor
+    struct State {
+        var sources: [AudioObjectID: Monitor.ProcessActivity] = [:]
+        var failList = false
+        var failedProcesses: Set<AudioObjectID> = []
+        var failListeners = false
+        var listeners: [Monitor.Property: (DispatchQueue, AudioObjectPropertyListenerBlock)] = [:]
+        var registrations = 0
+        var queries = 0
+        var transitions: [Bool] = []
+        var logs: [String] = []
+        var excludedPIDs: Set<pid_t> = [100]
+    }
+    let state = Locked(State())
+
+    var backend: Monitor.Backend {
+        Monitor.Backend(
+            processIDs: { [self] in
+                try state.access {
+                    $0.queries += 1
+                    if $0.failList { throw RegressionFailure(description: "process-list-unavailable") }
+                    return Array($0.sources.keys)
+                }
+            },
+            activity: { [self] object in
+                try state.access {
+                    if $0.failedProcesses.contains(object) {
+                        throw RegressionFailure(description: "process-unavailable")
+                    }
+                    guard let source = $0.sources[object] else {
+                        throw RegressionFailure(description: "process-exited")
+                    }
+                    return source
+                }
+            },
+            addListener: { [self] property, queue, block in
+                state.access {
+                    if $0.failListeners { return kAudioHardwareUnspecifiedError }
+                    $0.listeners[property] = (queue, block)
+                    $0.registrations += 1
+                    return noErr
+                }
+            },
+            removeListener: { [self] property, _, _ in
+                state.access { $0.listeners[property] = nil }
+            })
+    }
+
+    func notify(_ object: AudioObjectID = AudioObjectID(kAudioObjectSystemObject),
+                selector: AudioObjectPropertySelector = kAudioHardwarePropertyProcessObjectList) {
+        let property = Monitor.Property(object: object, selector: selector)
+        guard let (queue, block) = state.access({ $0.listeners[property] }) else { return }
+        queue.async {
+            var address = property.address
+            withUnsafePointer(to: &address) { block(1, $0) }
+        }
+    }
+
+    func monitor(initiallyActive: Bool = false) -> Monitor {
+        Monitor(initiallyActive: initiallyActive, backend: backend,
+                excludedPIDs: { [self] in state.access { $0.excludedPIDs } },
+                log: { [self] message in state.access { $0.logs.append(message) } },
+                onChange: { [self] active in state.access { $0.transitions.append(active) } })
     }
 }
 
@@ -143,6 +212,9 @@ private struct UIResponsivenessRegression {
                 return
             }
             if CommandLine.arguments.contains("--playback-policy") {
+                try testAudioActivityState()
+                try await testAudioMonitoring()
+                try await testNativeAudioMonitoring()
                 try testPlaybackPolicyEvaluation()
                 try testPlaybackPolicyInputs()
                 try testFullscreenPlaybackPolicy()
@@ -176,6 +248,9 @@ private struct UIResponsivenessRegression {
             try await testLockScreenDeployment()
             try await testRenderers()
             try await testLogs()
+            try testAudioActivityState()
+            try await testAudioMonitoring()
+            try await testNativeAudioMonitoring()
             try testPlaybackPolicyEvaluation()
             try testPlaybackPolicyInputs()
             try testFullscreenPlaybackPolicy()
@@ -185,6 +260,172 @@ private struct UIResponsivenessRegression {
             fputs("UIResponsivenessRegression: \(error)\n", stderr)
             exit(1)
         }
+    }
+
+    static func testAudioActivityState() throws {
+        typealias Monitor = PlaybackAudioMonitor
+        var state = Monitor.ActivityState()
+        _ = state.update(false, at: 0)
+        _ = state.update(true, at: 1)
+        _ = state.update(false, at: 1.2)
+        try require(!state.isActive, "A brief system sound interrupted playback")
+        _ = state.update(true, at: 2)
+        _ = state.update(false, at: 2.3)
+        _ = state.update(true, at: 2.4)
+        _ = state.update(true, at: 2.8)
+        try require(!state.isActive, "Separate audio pulses accumulated into a playback interruption")
+        _ = state.update(true, at: 2.91)
+        try require(state.isActive, "Sustained external output did not activate the rule")
+        _ = state.update(false, at: 3)
+        _ = state.update(true, at: 4)
+        try require(state.isActive, "A short gap between tracks resumed the wallpaper")
+        _ = state.update(false, at: 5)
+        _ = state.update(false, at: 6.49)
+        try require(state.isActive, "The audio rule released before the recovery interval")
+        _ = state.update(false, at: 6.5)
+        try require(!state.isActive, "Stopped external audio left the wallpaper paused")
+
+        state = Monitor.ActivityState(isActive: true)
+        _ = state.update(nil, at: 10)
+        _ = state.update(nil, at: 14.99)
+        try require(state.isActive, "An unavailable audio sample immediately released the rule")
+        _ = state.update(true, at: 15)
+        _ = state.update(nil, at: 20)
+        try require(state.isActive, "A recovered read did not reset the error grace period")
+        _ = state.update(nil, at: 25)
+        try require(!state.isActive, "Persistent audio errors permanently paused the wallpaper")
+        _ = state.update(true, at: 26)
+        _ = state.update(true, at: 26.5)
+        try require(state.isActive, "Audio detection did not recover after a persistent read failure")
+        state = Monitor.ActivityState()
+        _ = state.update(true, at: 0)
+        _ = state.update(nil, at: 0.4)
+        _ = state.update(true, at: 0.6)
+        try require(!state.isActive, "Unknown samples were counted toward confirmed activity")
+
+        let speechPath = "/System/Library/PrivateFrameworks/CoreSpeech.framework/corespeechd"
+        let speech = Monitor.ProcessActivity(pid: 610, bundleID: "com.apple.CoreSpeech",
+                                             executablePath: speechPath, output: true, input: true)
+        try require(speech.exclusionReason(excludedPIDs: []) == "speech-listener",
+                    "The verified CoreSpeech listener was treated as external playback")
+        var restarted = speech
+        restarted.pid = 9123
+        restarted.bundleID = ""
+        try require(restarted.exclusionReason(excludedPIDs: []) == "speech-listener",
+                    "Speech filtering depended on a transient PID or bundle identifier")
+        var unrelated = speech
+        unrelated.executablePath = "/Applications/Player.app/Contents/MacOS/corespeechd"
+        try require(unrelated.exclusionReason(excludedPIDs: []) == nil,
+                    "A process basename or framework bundle ID was enough to exclude an application")
+        let call = Monitor.ProcessActivity(pid: 300, bundleID: "com.apple.avconferenced", output: true, input: true)
+        try require(call.exclusionReason(excludedPIDs: []) == nil,
+                    "A voice call was ignored because it also uses the microphone")
+        try require(call.exclusionReason(excludedPIDs: [300]) == "mirage", "A renderer PID was not excluded")
+        let web = Monitor.ProcessActivity(pid: 400, bundleID: "com.apple.WebKit.GPU", name: "WebWallpaper Graphics and Media", output: true)
+        try require(web.exclusionReason(excludedPIDs: []) == "web-wallpaper", "A web wallpaper counted its own audio")
+        var browser = web
+        browser.name = "Safari Graphics and Media"
+        try require(browser.exclusionReason(excludedPIDs: []) == nil, "Ordinary browser audio was ignored")
+        print("PASS: audio source identity, confirmation, recovery, input/output calls and bounded read failures")
+    }
+
+    static func testAudioMonitoring() async throws {
+        typealias Monitor = PlaybackAudioMonitor
+        let probe = PlaybackAudioHardwareProbe()
+        probe.state.access {
+            $0.sources = [
+                10: Monitor.ProcessActivity(pid: 100, output: true),
+                11: Monitor.ProcessActivity(pid: 610, bundleID: "com.apple.CoreSpeech",
+                    executablePath: "/System/Library/PrivateFrameworks/CoreSpeech.framework/corespeechd", output: true, input: true),
+                12: Monitor.ProcessActivity(pid: 300, bundleID: "org.example.recorder", input: true)
+            ]
+        }
+        let monitor = probe.monitor()
+        monitor.start()
+        defer { monitor.stop() }
+        try await waitUntil("Audio listeners and initial sample") { probe.state.access { $0.listeners.count == 5 && !$0.logs.isEmpty } }
+        try require(probe.state.access { $0.transitions.isEmpty }, "Speech, input-only or wallpaper audio triggered the rule")
+        try require(probe.state.access { $0.logs.contains { $0.contains("speech-listener") } }, "Filtered audio sources were not diagnosed")
+
+        probe.state.access { $0.sources[13] = Monitor.ProcessActivity(pid: 400, bundleID: "org.example.player", output: true) }
+        probe.notify()
+        try await waitUntil("External audio onset from process notification", timeout: 1.5) {
+            probe.state.access { $0.transitions == [true] }
+        }
+        probe.state.access { $0.failedProcesses = [13] }
+        probe.notify(13, selector: kAudioProcessPropertyIsRunningOutput)
+        try await waitUntil("Read error diagnostic") { probe.state.access { $0.logs.last?.contains("raw=unknown") == true } }
+        try require(probe.state.access { $0.transitions == [true] }, "A process read failure resumed the wallpaper")
+        probe.state.access { $0.failedProcesses = []; $0.sources[13]?.output = false }
+        probe.notify(13, selector: kAudioProcessPropertyIsRunningOutput)
+        try await waitUntil("Stopped audio recovery", timeout: 2) { probe.state.access { $0.transitions == [true, false] } }
+        let registrations = probe.state.access { $0.registrations }
+        probe.notify(selector: kAudioHardwarePropertyServiceRestarted)
+        try await waitUntil("Audio server restart listener recovery") { probe.state.access { $0.registrations > registrations + 2 } }
+        probe.state.access { $0.sources[13] = nil }
+        probe.notify()
+        try await waitUntil("Exited process listener removal") {
+            probe.state.access { !$0.listeners.keys.contains { $0.object == 13 } }
+        }
+        probe.state.access { $0.sources[14] = Monitor.ProcessActivity(pid: 500, output: true); $0.excludedPIDs.insert(500) }
+        probe.notify()
+        try await waitUntil("New renderer PID exclusion") { probe.state.access { $0.logs.last?.contains("pid=500") == true } }
+        try require(probe.state.access { $0.transitions == [true, false] }, "A new renderer triggered the audio rule")
+        monitor.stop()
+        try await waitUntil("Listener cleanup on stop") { probe.state.access { $0.listeners.isEmpty } }
+        let stoppedQueries = probe.state.access { $0.queries }
+        try await Task.sleep(for: .milliseconds(550))
+        try require(probe.state.access { $0.queries == stoppedQueries }, "Stopped monitoring retained scheduled samples")
+
+        let fallback = PlaybackAudioHardwareProbe()
+        fallback.state.access { $0.failListeners = true }
+        let fallbackMonitor = fallback.monitor()
+        fallbackMonitor.start()
+        defer { fallbackMonitor.stop() }
+        try await waitUntil("Initial polling sample") { fallback.state.access { $0.queries > 0 } }
+        fallback.state.access { $0.sources[20] = Monitor.ProcessActivity(pid: 600, output: true) }
+        try await waitUntil("Polling fallback after listener failure", timeout: 3.5) { fallback.state.access { $0.transitions == [true] } }
+        fallback.state.access { $0.failList = true }
+        try await waitUntil("Process list failure", timeout: 3) { fallback.state.access { $0.logs.last?.contains("raw=unknown") == true } }
+        try require(fallback.state.access { $0.transitions == [true] }, "A process-list failure was treated as no audio")
+        fallbackMonitor.stop()
+        print("PASS: event-driven audio monitoring, process churn, restart recovery, polling fallback and cleanup")
+    }
+
+    static func testNativeAudioMonitoring() async throws {
+        typealias Monitor = PlaybackAudioMonitor
+        let native = Monitor.Backend()
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        let transitions = Locked([Bool]())
+        var backend = native
+        backend.activity = { object in
+            let activity = try native.activity(object)
+            return activity.pid == ownPID ? activity : Monitor.ProcessActivity()
+        }
+        let monitor = Monitor(backend: backend, excludedPIDs: { [] }, log: { _ in },
+                              onChange: { active in transitions.access { $0.append(active) } })
+        monitor.start()
+        defer { monitor.stop() }
+        let engine = AVAudioEngine()
+        let player = AVAudioPlayerNode()
+        let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 2)!
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4096)!
+        buffer.frameLength = buffer.frameCapacity
+        for channel in 0..<Int(format.channelCount) {
+            buffer.floatChannelData![channel].update(repeating: 0, count: Int(buffer.frameLength))
+        }
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: format)
+        engine.mainMixerNode.outputVolume = 0
+        player.scheduleBuffer(buffer, at: nil, options: .loops, completionHandler: nil)
+        try engine.start()
+        defer { engine.stop() }
+        player.play()
+        try await waitUntil("Native CoreAudio output detection", timeout: 4) { transitions.access { $0 == [true] } }
+        player.stop()
+        engine.stop()
+        try await waitUntil("Native CoreAudio output release", timeout: 4) { transitions.access { $0 == [true, false] } }
+        print("PASS: native CoreAudio process enumeration, output transitions and listener callbacks")
     }
 
     static func testPlaybackPolicyEvaluation() throws {
@@ -238,7 +479,7 @@ private struct UIResponsivenessRegression {
         defer { settingsModel.settings = saved }
         var windowQueries = 0
         var probes = GlobalSettingsViewModel.PolicyProbes(
-            onBattery: { true }, otherAppPlayingAudio: { _, _ in true }, displayAsleep: { _ in true },
+            onBattery: { true }, displayAsleep: { _ in true },
             windows: { windowQueries += 1; return [] })
         for rule in 0..<3 {
             var settings = GlobalSettings()
@@ -249,7 +490,8 @@ private struct UIResponsivenessRegression {
             default: settings.otherApplicationPlayingAudio = .mute; expected = .mute
             }
             settingsModel.settings = settings
-            let inputs = settingsModel.collectPolicyInputs(for: model)
+            var inputs = settingsModel.collectPolicyInputs(for: model)
+            inputs.otherAudioPlaying = true
             try require(inputs.wallpaperDisplays[display.displayID] != nil,
                         "An independent battery, sleep or audio rule lost its display")
             let result = try GlobalSettingsViewModel.computePlaybackActions(inputs, probes: probes).get()
@@ -262,6 +504,7 @@ private struct UIResponsivenessRegression {
                                     1002: CGRect(x: 1920, y: 0, width: 1920, height: 1080)]
         inputs.onBattery = .pause
         inputs.onAudio = .mute
+        inputs.otherAudioPlaying = true
         inputs.onDisplayAsleep = .stop
         probes.displayAsleep = { $0 == 1001 }
         let battery = try GlobalSettingsViewModel.computePlaybackActions(inputs, probes: probes).get()
@@ -337,7 +580,7 @@ private struct UIResponsivenessRegression {
         var queries = 0
         func evaluate(_ windows: [Policy.WindowEntry], _ sample: Policy.PolicyInputs) throws -> Policy.PolicyResult {
             var probes = Policy.PolicyProbes(
-                onBattery: { true }, otherAppPlayingAudio: { _, _ in false }, displayAsleep: { _ in false })
+                onBattery: { true }, displayAsleep: { _ in false })
             probes.windows = { queries += 1; return windows }
             let before = queries
             let result = try Policy.computePlaybackActions(sample, probes: probes).get()
