@@ -237,7 +237,7 @@ struct PropertyRow: View {
                     get: { property.normalizedComboValue(currentValue) },
                     set: { setValue($0) })) {
                     ForEach(visibleOptions, id: \.value) { opt in
-                        Text(WELocalization.resolve(opt.label)).tag(opt.value)
+                        Text(WEHTML.plain(WELocalization.resolve(opt.label))).tag(opt.value)
                     }
                 }
                 .labelsHidden()
