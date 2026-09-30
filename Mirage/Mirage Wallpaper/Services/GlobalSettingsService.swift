@@ -1572,6 +1572,10 @@ final class PlaybackAudioMonitor {
 
         func exclusionReason(excludedPIDs: Set<pid_t>) -> String? {
             if excludedPIDs.contains(pid) { return "mirage" }
+            if executablePath == "/usr/sbin/systemsoundserverd" ||
+                executablePath == "/usr/libexec/audiomxd" {
+                return "system-sound"
+            }
             if executablePath == "/System/Library/PrivateFrameworks/CoreSpeech.framework/corespeechd" ||
                 executablePath == "/System/Library/PrivateFrameworks/CoreSpeech.framework/corespeechd_system" {
                 return "speech-listener"
@@ -1740,7 +1744,7 @@ final class PlaybackAudioMonitor {
                     let reason = activity.exclusionReason(excludedPIDs: excluded)
                     if reason == nil { active = true }
                     let input = activity.input.map { $0 ? "1" : "0" } ?? "unknown"
-                    diagnostics.append("object=\(object) pid=\(activity.pid) bundle=\(activity.bundleID) input=\(input) output=1 reason=\(reason ?? "external")")
+                    diagnostics.append("object=\(object) pid=\(activity.pid) bundle=\(activity.bundleID) path=\(activity.executablePath ?? "unknown") input=\(input) output=1 reason=\(reason ?? "external")")
                 } catch {
                     failed = true
                     diagnostics.append("read failed \(error)")
