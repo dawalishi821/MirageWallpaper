@@ -3432,6 +3432,17 @@ JSValue NodeSceneSortLayer(JSContext* ctx, JSValueConst this_val, int argc,
     return JS_UNDEFINED;
 }
 
+JSValue NodeEmitParticles(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    double count = 1.0;
+    if (argc > 0 && ! JS_IsUndefined(argv[0]) && JS_ToFloat64(ctx, &count, argv[0]) != 0)
+        return JS_EXCEPTION;
+    if (! std::isfinite(count) || count <= 0.0) return JS_UNDEFINED;
+    if (auto* node = GetLayerNode(this_val))
+        node->EmitParticles(static_cast<u32>(std::min(std::floor(count),
+            static_cast<double>(std::numeric_limits<u32>::max()))));
+    return JS_UNDEFINED;
+}
+
 JSValue NodePlay(JSContext*, JSValueConst this_val, int, JSValueConst*) {
     if (auto* n = GetLayerNode(this_val)) n->Play();
     return JS_UNDEFINED;
@@ -4093,6 +4104,7 @@ const JSCFunctionListEntry s_layer_proto_funcs[] = {
     JS_CFUNC_DEF("destroyLayer", 1, NodeSceneDestroyLayer),
     JS_CFUNC_DEF("getLayerIndex", 1, NodeSceneGetLayerIndex),
     JS_CFUNC_DEF("sortLayer", 2, NodeSceneSortLayer),
+    JS_CFUNC_DEF("emitParticles", 1, NodeEmitParticles),
     JS_CFUNC_DEF("play", 0, NodePlay),
     JS_CFUNC_DEF("stop", 0, NodeStop),
     JS_CFUNC_DEF("pause", 0, NodePause),
@@ -5044,6 +5056,7 @@ FieldScript* JsRuntime::MakeFieldScript(
     I->wrapped_layer = wrapped;
     if (binding.material) I->wrapped_object = WrapMaterial(ctx, binding.material, I->implicit_animation);
     else if (binding.effect) I->wrapped_object = WrapEffect(ctx, binding.effect);
+    else if (binding.particle_instance && node) I->wrapped_object = WrapParticleInstance(ctx, node);
     struct RestoreBinding {
         JSContext* ctx;
         EngineHostState& host;

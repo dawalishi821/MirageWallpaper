@@ -174,6 +174,7 @@ struct FieldScriptBinding {
     std::shared_ptr<sr::SceneAnimationPlayback> animation;
     sr::SceneMaterial* material { nullptr };
     std::optional<sr::SceneImageEffectRef> effect;
+    bool particle_instance { false };
 };
 
 struct LayerAssetReference {

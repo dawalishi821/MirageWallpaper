@@ -1500,6 +1500,12 @@ public:
         m_pause_control      = std::move(pause);
         m_is_playing_control = std::move(is_playing);
     }
+    void SetParticleEmissionControl(std::function<void(u32)> emit) {
+        m_particle_emission = std::move(emit);
+    }
+    void EmitParticles(u32 count) {
+        if (m_particle_emission) m_particle_emission(count);
+    }
     void SetLayerPropertyControl(
         std::function<std::vector<float>(std::string_view)> get,
         std::function<void(std::string_view, std::span<const float>)> apply) {
@@ -1696,6 +1702,7 @@ private:
     std::function<bool()>               m_is_playing_control;
     std::function<std::vector<float>(std::string_view)> m_property_get;
     std::function<void(std::string_view, std::span<const float>)> m_property_apply;
+    std::function<void(u32)> m_particle_emission;
     bool                               m_layer_playing { true };
     float                              m_volume { 1.0f };
     std::shared_ptr<SceneSoundControl> m_sound_control;
@@ -1985,6 +1992,8 @@ using ParticleOperatorOp = std::function<void(const ParticleInfo&)>;
 struct ParticleEmitterState {
     double timer { 0.0 };
     double elapsed { 0.0 };
+    std::optional<u32> manual_count;
+    float count_scale { 1.0f };
 };
 
 using ParticleEmittOp = std::function<void(
@@ -2412,6 +2421,9 @@ public:
     std::optional<u32> RopeSequenceCount() const { return m_rope_sequence_count; }
     void SetRopeSubdivision(u32 value) { m_rope_subdivision = value; }
     void SetRateSource(std::function<double()> source) { m_rate_source = std::move(source); }
+    void SetEmissionRequests(std::shared_ptr<u32> requests) {
+        m_emission_requests = std::move(requests);
+    }
     void SetParentControlpointStartIndex(i32 value) {
         m_parent_controlpoint_start_index = value;
     }
@@ -2488,6 +2500,7 @@ private:
     bool      m_mesh_has_geometry { false };
     std::shared_ptr<ParticlePlaybackState> m_playback_state;
     u32       m_seen_reset_sequence { 0 };
+    std::shared_ptr<u32> m_emission_requests;
 
 public:
     u32 TrailLength() const { return m_trail_length; }

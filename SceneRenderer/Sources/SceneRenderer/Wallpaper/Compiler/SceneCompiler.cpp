@@ -1816,10 +1816,14 @@ void LoadEmitter(ParticleSubSystem& pSys, const wpscene::Particle& wp,
                  const ParticleInstanceModifiers& modifiers) {
     bool sort = false;
     for (const auto& em : wp.emitters) {
-        auto newEm = em;
-        newEm.rate *= modifiers.Count();
-        if (newEm.audioprocessingmode != 0) pSys.SetUsesAudioResponse();
-        pSys.AddEmitter(WPParticleParser::genParticleEmittOp(newEm, sort));
+        if (em.audioprocessingmode != 0) pSys.SetUsesAudioResponse();
+        pSys.AddEmitter([emit = WPParticleParser::genParticleEmittOp(em, sort), modifiers](
+            ParticleEmitterState& state, std::vector<Particle>& particles,
+            std::vector<ParticleInitOp>& initializers, u32 capacity, double elapsed,
+            std::span<const float> audio, std::span<const ParticleControlpoint> controlpoints) {
+            state.count_scale = modifiers.Count();
+            emit(state, particles, initializers, capacity, elapsed, audio, controlpoints);
+        });
     }
 }
 
@@ -4707,6 +4711,13 @@ void ParseParticleObj(ParseContext& context, wpscene::ParticleObject& wppartobj,
         static_cast<double>(particle_obj.starttime),
         particle_obj.flags[wpscene::Particle::FlagEnum::wordspace]);
 
+    auto emission_requests = std::make_shared<u32>(0);
+    if (! is_child) {
+        particleSub->SetEmissionRequests(emission_requests);
+        spNode->SetParticleEmissionControl([emission_requests, maxcount](u32 count) {
+            *emission_requests += std::min(count, maxcount - *emission_requests);
+        });
+    }
     particleSub->SetOwnerNode(spNode.as_ptr());
     particleSub->SetPlaybackState(playback_state);
     particleSub->SetRopeSubdivision(rope_subdivision);
@@ -4765,11 +4776,13 @@ void ParseParticleObj(ParseContext& context, wpscene::ParticleObject& wppartobj,
                 ApplyParticleOverride(*override_state, field, values);
             });
         spNode->SetPlaybackControl(
-            [playback_state]() {
+            [playback_state, emission_requests]() {
+                *emission_requests = 0;
                 playback_state->playing.store(true, std::memory_order_release);
                 playback_state->reset_sequence.fetch_add(1, std::memory_order_acq_rel);
             },
-            [playback_state]() {
+            [playback_state, emission_requests]() {
+                *emission_requests = 0;
                 playback_state->playing.store(false, std::memory_order_release);
                 playback_state->reset_sequence.fetch_add(1, std::memory_order_acq_rel);
             },
@@ -4779,6 +4792,31 @@ void ParseParticleObj(ParseContext& context, wpscene::ParticleObject& wppartobj,
             [playback_state]() {
                 return playback_state->playing.load(std::memory_order_acquire);
             });
+        for (const auto& [field, sb] : wppartobj.instance_field_bindings.scripts) {
+            const auto current = ReadParticleOverride(*override_state, field);
+            if (current.empty()) continue;
+            const bool vector = current.size() == 3;
+            auto& ss = EnsureScriptScene(context);
+            auto* fs = ss.runtime().MakeFieldScript(
+                sb.source, utils::genSha1(std::span<const char>(sb.source)),
+                vector ? script::FieldKind::Vec3 : script::FieldKind::Scalar,
+                ScriptPropertiesForField(context, field, sb), sb.initial_value,
+                spNode.as_ptr(), {}, {}, { .particle_instance = true });
+            if (! fs) continue;
+            RegisterFieldScriptMetadata(context, spNode.as_ptr(), fs);
+            ss.AddActuator({ fs, [override_state, field, vector](const script::ScriptValue& value) {
+                if (vector) {
+                    const auto previous = ReadParticleOverride(*override_state, field);
+                    const auto next = ScriptValueAsVec3(value, Vector3f(previous.data()));
+                    if (next) ApplyParticleOverride(*override_state, field,
+                                                   std::span<const float>(next->data(), 3));
+                } else {
+                    const auto next = ScriptValueAsFloat(value);
+                    if (next) ApplyParticleOverride(*override_state, field,
+                                                   std::span<const float>(&*next, 1));
+                }
+            } });
+        }
         AssignNodeFieldAnimations(*spNode.as_ptr(), wppartobj.field_bindings);
     }
     WireFieldScripts(context, spNode, wppartobj.field_bindings);
