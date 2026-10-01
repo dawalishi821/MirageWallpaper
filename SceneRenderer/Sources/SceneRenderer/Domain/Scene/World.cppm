@@ -2552,7 +2552,8 @@ public:
     virtual void InitUniforms(SceneNode*, const ExistsUniformOp&)                  = 0;
     virtual void UpdateUniforms(SceneNode*, sprite_map_t&, const UpdateUniformOp&,
                                 SceneRenderViewKind  = SceneRenderViewKind::Primary,
-                                SceneRenderAlphaMode = SceneRenderAlphaMode::Composite) = 0;
+                                SceneRenderAlphaMode = SceneRenderAlphaMode::Composite,
+                                SceneCamera* = nullptr) = 0;
     virtual void FrameEnd()                                                        = 0;
     virtual bool RequiresContinuousFrames() const { return true; }
 

@@ -3295,14 +3295,19 @@ void ParseImageObj(ParseContext& context, wpscene::ImageObject& img_obj,
     }
     const bool is_hidden_link_source =
         context.hidden_link_source_ids.count(static_cast<std::int32_t>(wpimgobj.id)) != 0;
+    const bool captures_children = wpimgobj.composite_layer && ! wpimgobj.copybackground &&
+        (has_author_effect ||
+         std::any_of(context.object_parent_ids.begin(), context.object_parent_ids.end(),
+                     [&](const auto& entry) { return entry.second == wpimgobj.id; }));
     const bool is_linked_composite =
         wpimgobj.composite_layer &&
         context.IsLinkedSource(static_cast<std::int32_t>(wpimgobj.id));
-    if (! has_author_effect && (is_hidden_link_source || is_linked_composite)) {
+    if (! has_author_effect && (is_hidden_link_source || is_linked_composite || captures_children)) {
         AppendLayerCompositePassthroughEffect(vfs, wpimgobj);
     }
     const bool composite_render_path =
-        wpimgobj.composite_layer && ! (is_hidden_link_source || is_linked_composite);
+        captures_children ||
+        (wpimgobj.composite_layer && ! (is_hidden_link_source || is_linked_composite));
 
     bool hasEffect =
         CountRuntimeImageEffects(wpimgobj.effects, context.scene_accesses_effects) > 0;
@@ -3830,7 +3835,7 @@ void ParseImageObj(ParseContext& context, wpscene::ImageObject& img_obj,
                                                         ? effect_camera_anchor->get()
                                                         : spImgNode.as_ptr());
         }
-        if (composite_render_path) {
+        if (captures_children) {
             const std::string group_camera = nodeAddr + "_group";
             const auto        group_extent =
                 NonZeroRenderTargetExtent(effect_target_size[0], effect_target_size[1]);
@@ -3857,7 +3862,8 @@ void ParseImageObj(ParseContext& context, wpscene::ImageObject& img_obj,
                                                     effect_ppong_b);
         image_effect_layer = imgEffectLayer;
         {
-            imgEffectLayer->SetRequiresSourceDraw(parse_geometry.requires_source_draw);
+            imgEffectLayer->SetRequiresSourceDraw(! captures_children &&
+                                                   parse_geometry.requires_source_draw);
             imgEffectLayer->SetFullscreen(wpimgobj.fullscreen);
             imgEffectLayer->SetFinalMaterialState(finalMaterialState);
             imgEffectLayer->SetSkipWhenNoRuntimeEffect(wpimgobj.fullscreen || isPassthrough);

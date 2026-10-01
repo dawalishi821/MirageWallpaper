@@ -310,7 +310,8 @@ SceneNode* find_layer_node(Scene& scene, WallpaperLayerId id) {
 
 void ensure_snapshot_link_render_targets(Scene& scene, const Set<i32>& linked_ids) {
     for (auto id : linked_ids) {
-        if (scene.elidable_layer_ids.count(id) == 0) continue;
+        if (scene.elidable_layer_ids.count(id) == 0 &&
+            ! scene.RenderGroupCamera(WallpaperLayerId { .value = id })) continue;
         auto layer = WallpaperLayerId { .value = id };
         auto key   = GenLinkTex(static_cast<std::ptrdiff_t>(id));
         if (scene.renderTargets.contains(key)) continue;
