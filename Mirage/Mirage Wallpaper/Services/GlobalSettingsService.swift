@@ -1573,7 +1573,9 @@ final class PlaybackAudioMonitor {
         func exclusionReason(excludedPIDs: Set<pid_t>) -> String? {
             if excludedPIDs.contains(pid) { return "mirage" }
             if executablePath == "/usr/sbin/systemsoundserverd" ||
-                executablePath == "/usr/libexec/audiomxd" {
+                executablePath == "/usr/libexec/audiomxd" ||
+                executablePath == "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow" ||
+                (executablePath == nil && bundleID == "com.apple.loginwindow") {
                 return "system-sound"
             }
             if executablePath == "/System/Library/PrivateFrameworks/CoreSpeech.framework/corespeechd" ||
