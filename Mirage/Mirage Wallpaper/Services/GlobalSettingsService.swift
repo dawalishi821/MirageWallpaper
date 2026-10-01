@@ -1603,7 +1603,8 @@ final class PlaybackAudioMonitor {
             if executablePath == "/usr/sbin/systemsoundserverd" ||
                 executablePath == "/usr/libexec/audiomxd" ||
                 executablePath == "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow" ||
-                (executablePath == nil && bundleID == "com.apple.loginwindow") {
+                executablePath == "/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter" ||
+                (executablePath == nil && (bundleID == "com.apple.loginwindow" || bundleID == "com.apple.controlcenter")) {
                 return "system-sound"
             }
             if executablePath == "/System/Library/PrivateFrameworks/CoreSpeech.framework/corespeechd" ||
