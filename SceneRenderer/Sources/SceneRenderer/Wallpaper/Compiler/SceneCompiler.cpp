@@ -5228,7 +5228,7 @@ void ParseTextObj(ParseContext& context, wpscene::TextObject& obj) {
         material.name     = "text";
         material.textures = { atlas_url };
         material.defines  = { "g_Texture0" };
-        material.blenmode = direct_text || copy_background_seed ? BlendMode::Translucent
+        material.blenmode = direct_text || copy_background_seed || has_bg ? BlendMode::Translucent
                                                                  : BlendMode::Normal;
         material.customShader.shader = shader;
         material.customShader.constValues[std::string(G_ALPHA)] = 1.0f;

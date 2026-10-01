@@ -560,7 +560,7 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
 
             SetBlend(blendmode, color_blend);
             SetAlphaBlendWritePolicy(color_blend, writes_alpha);
-            if (writes_alpha && m_desc.camera_override &&
+            if (writes_alpha && (material_ref.name == "text" || m_desc.camera_override) &&
                 color_blend.blendEnable)
                 color_blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
             m_desc.blending = color_blend.blendEnable;
