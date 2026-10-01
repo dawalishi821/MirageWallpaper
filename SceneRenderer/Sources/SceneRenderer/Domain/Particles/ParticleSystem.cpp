@@ -442,7 +442,6 @@ void ParticleSubSystem::SimulateInstance(
             if (m_trail_length > 0) inst.TrailsVec()[index].Reset();
         }
 
-        ParticleModify::MarkOld(p);
         if (! ParticleModify::LifetimeOk(p)) continue;
         ParticleModify::Reset(p);
         ParticleModify::ChangeLifetime(p, -simulation_time);
@@ -472,6 +471,7 @@ void ParticleSubSystem::SimulateInstance(
     };
     for (auto& operation : m_operators) operation(info);
     for (auto& p : info.particles) {
+        ParticleModify::MarkOld(p);
         if (! ParticleModify::LifetimeOk(p)) continue;
         ParticleModify::MoveByTime(p, simulation_time);
         ParticleModify::RotateByTime(p, simulation_time);
