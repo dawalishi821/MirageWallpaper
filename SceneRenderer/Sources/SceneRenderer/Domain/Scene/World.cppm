@@ -1795,6 +1795,14 @@ public:
         fullscreen = value;
         m_resolved = false;
     }
+    void SetExtent(float width, float height) {
+        width  = std::max(1.0f, width);
+        height = std::max(1.0f, height);
+        if (m_width == width && m_height == height) return;
+        m_width    = width;
+        m_height   = height;
+        m_resolved = false;
+    }
     void SetFinalBlend(BlendMode m) {
         m_final_blend = m;
         m_resolved    = false;

@@ -874,6 +874,9 @@ struct TextRuntimeTargets {
                 camera.Update();
                 changed = true;
             }
+            if (auto layer = camera.GetImgEffect(); layer)
+                layer->SetExtent(static_cast<float>(next_logical_w),
+                                 static_cast<float>(next_logical_h));
         }
 
         for (const auto& fbo : fbos) {
