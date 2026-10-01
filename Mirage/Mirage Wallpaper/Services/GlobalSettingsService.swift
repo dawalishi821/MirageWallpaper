@@ -1078,6 +1078,11 @@ class GlobalSettingsViewModel {
         var alpha: Double
     }
 
+    private struct FullscreenMatch {
+        let window: WindowEntry
+        var companion: WindowEntry? = nil
+    }
+
     struct PolicyProbes {
         var onBattery: () -> Bool? = GlobalSettingsViewModel.isOnBattery
         var displayAsleep: (CGDirectDisplayID) -> Bool = { CGDisplayIsAsleep($0) != 0 }
@@ -1232,7 +1237,7 @@ class GlobalSettingsViewModel {
             }
             let revealing = inputs.revealGraceDisplays.contains(displayID)
             let desktopExposed = needsWindows && isDesktopExposed(windows, display: bounds, inputs: inputs)
-            var fullscreen: WindowEntry?
+            var fullscreen: FullscreenMatch?
             if !revealing, !desktopExposed {
                 if inputs.onFullscreen != .keepRunning,
                    let window = fullscreenWindow(windows, display: bounds,
@@ -1348,8 +1353,9 @@ class GlobalSettingsViewModel {
     }
 
     private static func fullscreenWindow(_ windows: [WindowEntry], display: CGRect,
-                                         safeArea: CGRect?, inputs: PolicyInputs) -> WindowEntry? {
-        for window in windows where isFullscreenCandidate(window, inputs: inputs) {
+                                         safeArea: CGRect?, inputs: PolicyInputs) -> FullscreenMatch? {
+        let candidates = windows.filter { isFullscreenCandidate($0, inputs: inputs) }
+        for window in candidates {
             let intersection = window.bounds.intersection(display)
             guard !intersection.isNull else { continue }
             let displayArea = display.width * display.height
@@ -1362,21 +1368,42 @@ class GlobalSettingsViewModel {
                 abs(window.bounds.maxY - display.maxY) <= tolerance
             if edgesMatch || (intersectionArea / max(displayArea, 1) >= 0.985 &&
                               intersectionArea / max(windowArea, 1) >= 0.90) {
-                return window
+                return FullscreenMatch(window: window)
             }
             if let safeArea, safeArea.width > 0, safeArea.height > 0, display.contains(safeArea),
                abs(window.bounds.minX - safeArea.minX) <= 1,
                abs(window.bounds.minY - safeArea.minY) <= 1,
                abs(window.bounds.maxX - safeArea.maxX) <= 1,
                abs(window.bounds.maxY - safeArea.maxY) <= 1 {
-                return window
+                return FullscreenMatch(window: window)
+            }
+        }
+        var targets = [display]
+        if let safeArea, safeArea.width > 0, safeArea.height > 0, display.contains(safeArea) {
+            targets.append(safeArea)
+        }
+        for target in targets {
+            let aligned = candidates.filter {
+                abs($0.bounds.minX - target.minX) <= 1 &&
+                    abs($0.bounds.maxX - target.maxX) <= 1
+            }
+            for upper in aligned where abs(upper.bounds.minY - target.minY) <= 1 {
+                for lower in aligned where lower.pid == upper.pid {
+                    guard abs(lower.bounds.maxY - target.maxY) <= 1,
+                          lower.bounds.height > target.height / 2,
+                          upper.bounds.height < lower.bounds.height,
+                          lower.bounds.minY > upper.bounds.minY + 1,
+                          upper.bounds.maxY < lower.bounds.maxY - 1,
+                          upper.bounds.maxY - lower.bounds.minY > 1 else { continue }
+                    return FullscreenMatch(window: lower, companion: upper)
+                }
             }
         }
         return nil
     }
 
     private static func fullscreenDiagnostic(_ windows: [WindowEntry], display: CGRect, safeArea: CGRect?,
-                                             inputs: PolicyInputs, match: WindowEntry?, revealing: Bool,
+                                             inputs: PolicyInputs, match: FullscreenMatch?, revealing: Bool,
                                              desktopExposed: Bool) -> String {
         func rectangle(_ bounds: CGRect) -> String {
             "\(bounds.minX),\(bounds.minY),\(bounds.width),\(bounds.height)"
@@ -1387,8 +1414,9 @@ class GlobalSettingsViewModel {
             "pid=\($0.pid),layer=\($0.layer),alpha=\($0.alpha),eligible=\(isFullscreenCandidate($0, inputs: inputs)),bounds=\(rectangle($0.bounds))"
         }.joined(separator: ";")
         let safe = safeArea.map(rectangle) ?? "none"
-        let matched = match.map { "\($0.pid):\(rectangle($0.bounds))" } ?? "none"
-        return "bounds=\(rectangle(display)) safe=\(safe) front=\(inputs.frontPID ?? 0) reveal=\(revealing) exposed=\(desktopExposed) match=\(matched) windows=[\(candidates)]"
+        let matched = match.map { "\($0.window.pid):\(rectangle($0.window.bounds))" } ?? "none"
+        let companion = match?.companion.map { "\($0.pid):\(rectangle($0.bounds))" } ?? "none"
+        return "bounds=\(rectangle(display)) safe=\(safe) front=\(inputs.frontPID ?? 0) reveal=\(revealing) exposed=\(desktopExposed) match=\(matched) companion=\(companion) windows=[\(candidates)]"
     }
 
     private static func appHasVisibleWindows(_ windows: [WindowEntry], pid: pid_t?) -> Bool {
