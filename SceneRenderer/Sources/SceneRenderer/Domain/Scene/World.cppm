@@ -1730,7 +1730,7 @@ private:
 struct SceneImageEffectNode {
     std::string                                 output; // render target
     rstd::sync::Arc<SceneNode>                  sceneNode;
-    bool                                        uses_unit_final_quad { false };
+    bool                                        uses_pixel_position { false };
     Map<std::string, SceneShaderValueAnimation> final_quad_shader_values;
 };
 

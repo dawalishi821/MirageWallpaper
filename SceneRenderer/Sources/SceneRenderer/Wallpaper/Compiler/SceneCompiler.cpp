@@ -2405,7 +2405,7 @@ bool UsesEffectPositionSpace(const wpscene::Material& wpmat) {
     return mode_it != wpmat.combos.end() && mode_it->second == 1;
 }
 
-bool UsesUnitFinalQuad(const wpscene::Material& wpmat) {
+bool UsesPixelEffectPosition(const wpscene::Material& wpmat) {
     if (wpmat.shader != "effects/transform") return false;
     auto mode_it = wpmat.combos.find("MODE");
     return mode_it != wpmat.combos.end() && mode_it->second == 1;
@@ -4170,7 +4170,7 @@ void ParseImageObj(ParseContext& context, wpscene::ImageObject& img_obj,
                 imgEffect->nodes.push_back(SceneImageEffectNode {
                     .output                   = matOutRT,
                     .sceneNode                = spEffNode.clone(),
-                    .uses_unit_final_quad     = UsesUnitFinalQuad(wpmat),
+                    .uses_pixel_position      = UsesPixelEffectPosition(wpmat),
                     .final_quad_shader_values = std::move(final_quad_shader_values),
                 });
             }
@@ -5683,7 +5683,7 @@ void ParseTextObj(ParseContext& context, wpscene::TextObject& obj) {
                     effect->nodes.push_back(SceneImageEffectNode {
                         .output                   = matOutRT,
                         .sceneNode                = effect_node.clone(),
-                        .uses_unit_final_quad     = UsesUnitFinalQuad(wpmat),
+                        .uses_pixel_position      = UsesPixelEffectPosition(wpmat),
                         .final_quad_shader_values = std::move(final_quad_shader_values),
                     });
                 }
