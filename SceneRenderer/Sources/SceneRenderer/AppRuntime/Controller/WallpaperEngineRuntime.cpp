@@ -997,7 +997,7 @@ bool ApplyUserPropertyToPostProcessEnable(Scene& scene, const std::string& key, 
 }
 
 void ApplyUserPropertyBeforeFirstGraph(Scene& scene, const std::string& key, const Json& prop) {
-    sr::script::SetSceneUserProperty(scene, key, prop);
+    scene.ApplyUserLightVisibilityBindings(key, prop);
     ApplyUserPropertyToClear(scene, key, prop);
     ApplyUserPropertyToShaderUniforms(scene, key, prop);
     (void)ApplyUserPropertyToMaterialTextures(scene, key, prop);
@@ -2161,6 +2161,7 @@ void SceneRuntimeController::loadScene() {
             const auto& prop               = *entry_value;
             ApplyUserPropertyBeforeFirstGraph(*scene, key, prop);
         });
+        sr::script::SetSceneUserProperties(*scene, m_user_properties);
         if (m_user_shortcut_cb) {
             sr::script::SetSceneUserShortcutOpener(
                 *scene,

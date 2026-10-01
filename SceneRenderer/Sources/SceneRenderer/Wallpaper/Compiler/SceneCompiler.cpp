@@ -618,11 +618,7 @@ script::ScriptScene& EnsureScriptScene(ParseContext& context) {
                 };
             });
         if (context.user_properties.is_some())
-            (*context.user_properties)->iter().for_each([&](auto entry) {
-                auto [entry_key, entry_value] = entry;
-                auto key                      = rstd::cppstd::as_string_view(entry_key->as_str());
-                context.script_scene->runtime().SetUserProperty(key, *entry_value);
-            });
+            context.script_scene->runtime().SetUserProperties(**context.user_properties, false);
         for (const auto& binding : context.image_alignment_bindings) {
             InstallImageAlignmentBinding(context.script_scene->runtime(),
                                          binding.node,
@@ -1165,7 +1161,8 @@ void WireFieldScripts(ParseContext& context, const rstd::sync::Arc<SceneNode>& n
         auto  props         = ScriptPropertiesForField(context, field, sb);
         auto  initial_value = ScriptInitialValueForField(field, sb.initial_value);
         auto* fs =
-            rt.MakeFieldScript(sb.source, sha, kind, props, initial_value, node, std::move(clones));
+            rt.MakeFieldScript(sb.source, sha, kind, props, initial_value, node, std::move(clones),
+                               {}, { .animation = node->FieldAnimation(field) });
         if (! fs) continue;
         RegisterFieldScriptMetadata(context, node, fs);
         if (is_visible && ! is_container && node != nullptr && node->ID() >= 0 &&
@@ -2469,7 +2466,8 @@ script::FieldScript* RegisterMaterialValueScript(ParseContext&                  
                                                  SceneNode*                     owner,
                                                  const wpscene::Material&       material,
                                                  const std::string&             material_key,
-                                                 const wpscene::ScriptBinding& binding) {
+                                                 const wpscene::ScriptBinding& binding,
+                                                 script::FieldScriptBinding self = {}) {
     if (! owner) return nullptr;
     auto value = material.constantshadervalues.find(material_key);
     if (value == material.constantshadervalues.end()) return nullptr;
@@ -2489,7 +2487,7 @@ script::FieldScript* RegisterMaterialValueScript(ParseContext&                  
                                                                                kind,
                                                                                binding.properties,
                                                                                binding.initial_value,
-                                                                               owner);
+                                                                               owner, {}, {}, std::move(self));
     RegisterFieldScriptMetadata(context, owner, field_script);
     return field_script;
 }
@@ -2508,11 +2506,12 @@ void RegisterImageEffectVisibilityScript(
                                                             script::FieldKind::Bool,
                                                             binding->second.properties,
                                                             binding->second.initial_value,
-                                                            owner);
+                                                            owner, {}, {},
+                                                            { .effect = SceneImageEffectRef {
+                                                                .layer = effect_layer.get(),
+                                                                .effect = effect } });
     RegisterFieldScriptMetadata(context, owner, field_script);
     if (! field_script) return;
-    scripts.runtime().SetFieldScriptEffectSelf(
-        *field_script, { .layer = effect_layer.get(), .effect = effect });
     auto* scene = context.scene.get();
     scripts.AddActuator({
         field_script,
@@ -2610,15 +2609,15 @@ void RegisterShaderUserVarIndex(ParseContext& context, SceneNode* owner,
          wpmat.constantshadervalues_bindings.scripts) {
         auto uniform_name = ResolveShaderMaterialKey(info, material_key);
         if (uniform_name.empty()) continue;
-        auto* field_script =
-            RegisterMaterialValueScript(context, owner, wpmat, material_key, binding);
-        if (! field_script) continue;
+        script::FieldScriptBinding self { .material = stable_mat.get() };
         if (auto animation = stable_mat->customShader.valueAnimations.find(uniform_name);
             animation != stable_mat->customShader.valueAnimations.end() &&
             animation->second.curve && animation->second.curve->playback) {
-            scripts.runtime().SetImplicitAnimation(*field_script,
-                                                    animation->second.curve->playback);
+            self.animation = animation->second.curve->playback;
         }
+        auto* field_script = RegisterMaterialValueScript(context, owner, wpmat, material_key,
+                                                          binding, std::move(self));
+        if (! field_script) continue;
         scripts.AddActuator({
             field_script,
             [pScene, stable_mat, uniform_name = std::move(uniform_name)](
@@ -6934,6 +6933,7 @@ std::shared_ptr<Scene> FinalizeScene(ParseContext& context) {
             return node;
         });
         runtime.SetSceneRoot(scene->sceneGraph.as_ptr());
+        scripts->ApplyPendingValues();
         scene->CommitDynamicTopology();
         sr::script::InstallScriptScene(*scene, std::move(scripts));
     }
@@ -7291,6 +7291,7 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view              scene_
             }
             wpscene::FieldBindings fb;
             wpscene::AbsorbAllFieldBindings(o, fb);
+            AssignNodeFieldAnimations(*node.as_ptr(), fb);
             WireFieldScripts(context, node, fb, {}, {}, {}, true);
             std::string attachment;
             sr::GetJsonValue(o, "attachment", attachment, false);

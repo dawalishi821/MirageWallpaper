@@ -1437,6 +1437,13 @@ public:
     void RegisterAnimationPlayback(const std::shared_ptr<SceneAnimationPlayback>& playback);
     std::vector<SceneAnimationEvent> ConsumeAnimationEvents();
     std::shared_ptr<SceneAnimationPlayback> FindAnimation(std::string_view name) const;
+    std::shared_ptr<SceneAnimationPlayback> FieldAnimation(std::string_view field) const {
+        const auto* curve = field == "origin" ? &m_origin_curve :
+                            field == "scale" ? &m_scale_curve :
+                            field == "angles" ? &m_rotation_curve :
+                            field == "alpha" ? &m_alpha_curve : nullptr;
+        return curve && *curve ? (*curve)->playback : nullptr;
+    }
     bool HasFieldAnimations() const {
         return m_origin_curve || m_scale_curve || m_rotation_curve || m_alpha_curve ||
                ! m_field_animation_playbacks.empty();
@@ -3164,6 +3171,7 @@ public:
     void                      RegisterAuthoredLayer(WallpaperLayerId id, i32 parent_id);
     std::optional<std::size_t> LayerIndex(const SceneNode& node) const;
     bool                       SortLayer(SceneNode& node, std::size_t index);
+    bool ReparentLayer(SceneNode& node, SceneNode* parent, bool adjust_transforms);
     SceneResourceIndex&       ResourceIndex() { return m_resource_index; }
     const SceneResourceIndex& ResourceIndex() const { return m_resource_index; }
     uint32_t                  ResourceGeneration() const { return m_resource_generation; }
