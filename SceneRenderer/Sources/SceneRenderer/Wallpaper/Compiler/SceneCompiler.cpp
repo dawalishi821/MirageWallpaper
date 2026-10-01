@@ -5706,23 +5706,21 @@ void ParseTextObj(ParseContext& context, wpscene::TextObject& obj) {
     RegisterHiddenTextEffectScripts(context, compose_node.as_ptr(), obj.effects);
 
     auto compose_hold      = SceneNodeArcHold(compose_node.clone());
-    auto apply_text_anchor = [compose_hold, anchor_state]() {
-        auto* compose_ptr = compose_hold.get();
-        const auto& scale = compose_ptr->Scale();
-        const auto anchored = text::ResolveTextAnchorPosition(anchor_state->horizontal,
-                                                              anchor_state->vertical,
-                                                              anchor_state->origin.x(),
-                                                              anchor_state->origin.y(),
-                                                              anchor_state->width,
-                                                              anchor_state->height,
-                                                              scale.x(),
-                                                              scale.y(),
-                                                              anchor_state->line_box_width,
-                                                              anchor_state->line_box_height);
-        Vector3f pos = anchor_state->origin;
-        pos.x()      = anchored[0];
-        pos.y()      = anchored[1];
-        compose_ptr->SetTranslate(pos);
+    auto apply_text_anchor = [compose_hold, anchor_state, layouter, direct_text]() {
+        auto*      node = compose_hold.get();
+        const auto offset = text::ResolveTextAnchorPosition(
+            anchor_state->horizontal, anchor_state->vertical, 0.0f, 0.0f,
+            anchor_state->width, anchor_state->height, 1.0f, 1.0f,
+            anchor_state->line_box_width, anchor_state->line_box_height);
+        Vector3d   draw_offset { offset[0], offset[1], 0.0 };
+        const auto metrics = layouter->Metrics();
+        if (direct_text && metrics.source_centered) {
+            draw_offset.x() += metrics.source_center_x;
+            draw_offset.y() += metrics.source_center_y;
+        }
+        node->SetTranslate(anchor_state->origin);
+        node->SetGeometryTransform(Affine3d(Translation3d(draw_offset)).matrix());
+        node->SetHitCenter({ offset[0], offset[1] });
     };
 
 
@@ -5745,7 +5743,10 @@ void ParseTextObj(ParseContext& context, wpscene::TextObject& obj) {
             anchor_state->width = std::max(1.0f, metrics.text_width + 2.0f * text_padding);
         if (! anchor_state->authored_height)
             anchor_state->height = std::max(1.0f, metrics.text_height + 2.0f * text_padding);
-        compose_ptr->SetSize({ anchor_state->width, anchor_state->height });
+        const float frame_padding =
+            geometry_policy.preserve_text_bbox ? 2.0f * text_padding : 0.0f;
+        compose_ptr->SetSize(
+            { metrics.text_width + frame_padding, metrics.text_height + frame_padding });
         anchor_state->line_box_width  = std::max(1.0f, metrics.text_width);
         anchor_state->line_box_height = std::max(1.0f, metrics.text_height);
         apply_text_anchor();
